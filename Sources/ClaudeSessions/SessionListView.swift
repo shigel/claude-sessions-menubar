@@ -146,9 +146,20 @@ final class SessionListViewModel: ObservableObject {
         }
     }
 
-    func refresh() async {
+    /// - Parameter collapseExpanded: true for the popover-open call (the
+    ///   documented "パネルを開くたびに畳む" behavior above), false for a
+    ///   refresh triggered while the popover is already visible — either the
+    ///   `ProjectsWatcher` FSEvents callback or the manual reload
+    ///   button/⌘R. Those must NOT reset `expandedProjects`/`selectedID`,
+    ///   since the whole point is to pick up new sessions quietly while the
+    ///   user is mid-browse; collapsing everything out from under them on
+    ///   every filesystem write would be a worse experience than the stale
+    ///   list this exists to fix (see issue #2).
+    func refresh(collapseExpanded: Bool = true) async {
         isLoading = true
-        expandedProjects.removeAll()
+        if collapseExpanded {
+            expandedProjects.removeAll()
+        }
 
         // Start the (slow, osascript-backed) window enumeration in parallel
         // with the session scan, and keep the Task around so
@@ -157,8 +168,18 @@ final class SessionListViewModel: ObservableObject {
         // Cancel any previous prefetch first: window state may have changed
         // since the popover was last open, so we don't want to serve a
         // stale result.
-        windowsPrefetchTask?.cancel()
-        windowsPrefetchTask = Task { await WindowController.listEditorWindows() }
+        //
+        // Only for `collapseExpanded` (real popover-open) calls: a
+        // background-triggered refresh (FSEvents, manual reload) is about
+        // picking up new *session* files, not new editor windows, and
+        // re-running the osascript round-trip on every one — which, during
+        // an active session, can fire every couple of seconds — would spam
+        // System Events for no benefit. The window list from the last
+        // popover-open prefetch stays valid for those.
+        if collapseExpanded {
+            windowsPrefetchTask?.cancel()
+            windowsPrefetchTask = Task { await WindowController.listEditorWindows() }
+        }
 
         sessions = await SessionScanner.scan()
         isLoading = false
@@ -317,6 +338,22 @@ struct SessionListView: View {
     /// every keystroke; we only piggyback on the down-arrow to move focus.
     @State private var downArrowMonitor: Any?
 
+    /// Watches `~/.claude/projects` for filesystem changes so a session
+    /// created while the popover is already open shows up without the user
+    /// having to close and reopen it (see `ProjectsWatcher`, issue #2).
+    /// Held in `@State` purely to keep it alive for the view's lifetime —
+    /// nothing reads it back.
+    @State private var projectsWatcher: ProjectsWatcher?
+
+    /// Debounces `ProjectsWatcher` callbacks on top of the 0.5s coalescing
+    /// `ProjectsWatcher` already does at the OS level. An active session
+    /// appends to its jsonl file on every turn, so without this a long
+    /// session left open in the popover would re-trigger `refresh()` — and
+    /// therefore a full `SessionScanner.scan()` — every few seconds. This
+    /// adds a longer, trailing-edge wait so bursts collapse into one
+    /// refresh instead of one per burst tick.
+    @State private var refreshDebounceTask: Task<Void, Never>?
+
     var body: some View {
         VStack(spacing: 0) {
             if !viewModel.hasAccessibilityPermission {
@@ -366,6 +403,27 @@ struct SessionListView: View {
             }
             downArrowMonitor = nil
         }
+        .onAppear {
+            guard projectsWatcher == nil else { return }
+            projectsWatcher = ProjectsWatcher(paths: [SessionScanner.projectsDir.path]) {
+                // Callback fires on a background queue (see
+                // `FSEventStreamSetDispatchQueue` in `ProjectsWatcher`), so
+                // hop onto the main actor before touching view state.
+                Task { @MainActor in
+                    refreshDebounceTask?.cancel()
+                    refreshDebounceTask = Task {
+                        try? await Task.sleep(for: .seconds(2))
+                        guard !Task.isCancelled else { return }
+                        await viewModel.refresh(collapseExpanded: false)
+                    }
+                }
+            }
+        }
+        .onDisappear {
+            projectsWatcher = nil
+            refreshDebounceTask?.cancel()
+            refreshDebounceTask = nil
+        }
     }
 
     private enum KeyCode {
@@ -399,6 +457,22 @@ struct SessionListView: View {
             if viewModel.isLoading {
                 ProgressView().controlSize(.small)
             }
+            // Explicit escape hatch for issue #2: ProjectsWatcher covers the
+            // common case automatically, but this stays as a deterministic
+            // fallback for anything it misses (e.g. a profile root that
+            // didn't exist yet when the watcher started).
+            // `collapseExpanded: false` for the same reason as the watcher
+            // callback — an explicit reload shouldn't fold the list the user
+            // is looking at.
+            Button {
+                Task { await viewModel.refresh(collapseExpanded: false) }
+            } label: {
+                Image(systemName: "arrow.clockwise")
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(.secondary)
+            .keyboardShortcut("r", modifiers: .command)
+            .help("一覧を再読み込み (⌘R)")
         }
         .padding(8)
     }

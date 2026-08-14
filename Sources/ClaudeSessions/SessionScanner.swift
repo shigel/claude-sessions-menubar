@@ -66,7 +66,9 @@ enum SessionScanner {
         static let tailEscalatedBytes = 256 * 1024
     }
 
-    private static var projectsDir: URL {
+    /// Exposed (not `private`) so `ProjectsWatcher` can watch the same root
+    /// this scanner reads from without duplicating the path construction.
+    static var projectsDir: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude")
             .appendingPathComponent("projects")
