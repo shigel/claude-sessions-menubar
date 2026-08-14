@@ -1,5 +1,6 @@
 import AppKit
 import IOKit.hid
+import ServiceManagement
 import SwiftUI
 
 /// Transparent overlay placed on top of the status bar button that intercepts
@@ -180,6 +181,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
             menu.addItem(.separator())
         }
+        let loginItem = NSMenuItem(
+            title: "ログイン時に起動", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        loginItem.target = self
+        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        menu.addItem(loginItem)
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "終了", action: #selector(quitApp), keyEquivalent: "q"))
         statusItem?.menu = menu
         statusItem?.button?.performClick(nil)
@@ -198,6 +205,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quitApp() {
         NSApp.terminate(nil)
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+        } catch {
+            NSLog("ClaudeSessions: failed to toggle login item: \(error)")
+        }
     }
 
     private func openPopover() {

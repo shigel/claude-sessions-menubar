@@ -7,7 +7,13 @@ import SwiftUI
 /// with a real path.
 enum RowID: Hashable {
     case project(String)   // ProjectSession.path
-    case session(String)   // ClaudeSession.sessionId
+    /// ClaudeSession.fileURL.path, NOT sessionId. Session ids are only
+    /// unique within one profile — seeding a second profile from a copy of
+    /// another duplicates them wholesale — and a duplicated tag makes
+    /// `List(selection:)` and `ForEach` silently misbehave. The file path is
+    /// unique by construction, and the scanner must not dedupe by session id
+    /// to compensate (that would drop real sessions from other profiles).
+    case session(String)
 }
 
 /// One row as the user sees it, in visual (top-to-bottom) order. Session
@@ -103,8 +109,16 @@ final class SessionListViewModel: ObservableObject {
             if projectMatches {
                 return FilteredProject(project: project, sessions: project.sessions, forceExpanded: false)
             }
+            // Profile label is matched on the session side only, never as
+            // part of the project-row match above: a project-row match shows
+            // ALL of its sessions, so typing "vanilla" would surface every
+            // session of any project that happens to have one, defeating the
+            // filter. Matching here instead narrows to just that profile's
+            // sessions and force-expands them.
             let matchingSessions = project.sessions.filter {
-                $0.title.lowercased().contains(needle) || $0.shortId.lowercased().contains(needle)
+                $0.title.lowercased().contains(needle)
+                    || $0.shortId.lowercased().contains(needle)
+                    || ($0.profileLabel?.lowercased().contains(needle) ?? false)
             }
             guard !matchingSessions.isEmpty else { return nil }
             return FilteredProject(project: project, sessions: matchingSessions, forceExpanded: true)
@@ -136,7 +150,7 @@ final class SessionListViewModel: ObservableObject {
                 Row(
                     kind: .session(session),
                     project: entry.project,
-                    id: .session(session.sessionId),
+                    id: .session(session.fileURL.path),
                     isExpandable: false,
                     isExpanded: false,
                     visibleSessionCount: 0
@@ -178,8 +192,8 @@ final class SessionListViewModel: ObservableObject {
         if let selectedID, rows.contains(where: { $0.id == selectedID }) {
             return
         }
-        if case .session(let sessionId)? = selectedID,
-           let parentProject = sessions.first(where: { project in project.sessions.contains { $0.sessionId == sessionId } }),
+        if case .session(let filePath)? = selectedID,
+           let parentProject = sessions.first(where: { project in project.sessions.contains { $0.fileURL.path == filePath } }),
            rows.contains(where: { $0.id == .project(parentProject.path) }) {
             selectedID = .project(parentProject.path)
             return
@@ -583,6 +597,22 @@ private struct ProjectRow: View {
                     .foregroundColor(.secondary)
             }
             Spacer()
+            // A project with a single session never renders a child row (see
+            // ProjectSession.isExpandable), so one living only in a
+            // non-default profile would otherwise show no trace of which
+            // profile it came from. Surface it on the project row instead.
+            // Only when the project is unambiguously from one non-default
+            // profile — a mixed project is expandable, and its children carry
+            // their own badges.
+            if !row.isExpandable, row.project.profileLabels.count == 1,
+               let profileLabel = row.project.profileLabels.first {
+                Text(profileLabel)
+                    .font(.caption2)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                    .foregroundColor(.secondary)
+            }
             if row.visibleSessionCount > 1 {
                 Text("\(row.visibleSessionCount)")
                     .font(.caption2)
@@ -639,6 +669,13 @@ private struct SessionChildRow: View {
                     .foregroundColor(session.titleSource == .sessionId ? .secondary : .primary)
                 HStack(spacing: 4) {
                     Text(Self.relativeFormatter.localizedString(for: session.lastActive, relativeTo: Date()))
+                    // Profile leads the badge run: it says which config tree
+                    // the session lives in, which is a stronger distinction
+                    // than how it was launched. The default profile stays
+                    // unbadged, matching how `entrypoint == "cli"` does.
+                    if let profileLabel = session.profileLabel {
+                        badge(profileLabel)
+                    }
                     if session.entrypoint == "sdk-cli" {
                         badge("auto")
                     }
