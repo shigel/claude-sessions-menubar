@@ -45,6 +45,12 @@ final class SessionListViewModel: ObservableObject {
     @Published var statusMessage: String?
     @Published var windowPicker: WindowPickerState?
     @Published var hasAccessibilityPermission: Bool = WindowController.checkAccessibilityPermission(prompt: false)
+    /// Invoked after a session was successfully opened — an editor window
+    /// was focused, or a new one was launched (issue #9). The owner of this
+    /// view model (`AppDelegate`) wires this to dismiss the popover, so
+    /// completing a selection always leaves the popover closed and ready
+    /// for the global shortcut to reopen it.
+    var onSessionOpened: (() -> Void)?
     /// Currently highlighted row in the session list, driven by keyboard
     /// navigation (arrow keys) or mouse hover/click via `List(selection:)`.
     @Published var selectedID: RowID?
@@ -263,6 +269,7 @@ final class SessionListViewModel: ObservableObject {
         do {
             try await WindowController.focusWindow(processName: window.processName, title: window.title)
             statusMessage = "\(window.title) をフォーカスしました"
+            onSessionOpened?()
         } catch {
             statusMessage = "フォーカス失敗: \(error.localizedDescription)"
         }
@@ -283,6 +290,7 @@ final class SessionListViewModel: ObservableObject {
             try WindowController.openInEditor(appName: editor.appName, path: session.path)
             PreferenceStore.setPreferredEditorId(editor.id, forProjectPath: session.path)
             statusMessage = "\(editor.name) で開きました"
+            onSessionOpened?()
         } catch {
             statusMessage = "起動失敗: \(error.localizedDescription)"
         }
