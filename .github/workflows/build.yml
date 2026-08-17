@@ -1,0 +1,19 @@
+name: build
+
+# macos-14 ランナーを使う: このパッケージは Package.swift で `.macOS(.v14)` を
+# 要求しており（AppKit/SwiftUI/IOKit.hid 依存）、Linuxランナーでは
+# `swift build` が原理的に成功しない。自動issueトリアージroutine（Linuxサンドボックス
+# 上で動く）はローカルで `swift build` を実行できないため、代わりにこのCIの成功を
+# ビルド確認のゲートとして使う。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: swift build
+        run: swift build
