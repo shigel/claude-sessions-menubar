@@ -45,6 +45,12 @@ final class SessionListViewModel: ObservableObject {
     @Published var statusMessage: String?
     @Published var windowPicker: WindowPickerState?
     @Published var hasAccessibilityPermission: Bool = WindowController.checkAccessibilityPermission(prompt: false)
+    /// Invoked after a session was successfully opened — an editor window
+    /// was focused, or a new one was launched (issue #9). The owner of this
+    /// view model (`AppDelegate`) wires this to dismiss the popover, so
+    /// completing a selection always leaves the popover closed and ready
+    /// for the global shortcut to reopen it.
+    var onSessionOpened: (() -> Void)?
     /// Currently highlighted row in the session list, driven by keyboard
     /// navigation (arrow keys) or mouse hover/click via `List(selection:)`.
     @Published var selectedID: RowID?
@@ -65,6 +71,17 @@ final class SessionListViewModel: ObservableObject {
     /// the popover is open, so this is a short-lived cache, not a
     /// long-lived one.
     private var windowsPrefetchTask: Task<[EditorWindow], Never>?
+
+    /// Incremented every time `refresh()` runs, i.e. every time the popover
+    /// opens. `focus(window:)`/`open(_:with:)` capture this at the start of
+    /// their (possibly slow, `osascript`-backed) work and compare it again
+    /// once that work finishes, before touching `statusMessage` or firing
+    /// `onSessionOpened`. Without this, a selection that's still in flight
+    /// when the popover is closed and quickly reopened would — on
+    /// completion — overwrite the new popover's status with stale text and,
+    /// worse, call `onSessionOpened` and close the popover the user just
+    /// reopened (PR #14 review).
+    private var generation = 0
 
     struct WindowPickerState: Identifiable {
         let id = UUID()
@@ -149,6 +166,13 @@ final class SessionListViewModel: ObservableObject {
     func refresh() async {
         isLoading = true
         expandedProjects.removeAll()
+        // Popover reopened: any in-flight selection from the previous time
+        // it was open is now stale — see `generation`'s doc comment. Also
+        // clear its leftover status message (e.g. "◯◯をフォーカスしました"
+        // from right before the popover closed), which otherwise sits there
+        // until the next selection overwrites it (PR #14 review nit).
+        generation += 1
+        statusMessage = nil
 
         // Start the (slow, osascript-backed) window enumeration in parallel
         // with the session scan, and keep the Task around so
@@ -260,10 +284,18 @@ final class SessionListViewModel: ObservableObject {
     }
 
     func focus(window: EditorWindow) async {
+        let requestGeneration = generation
         do {
             try await WindowController.focusWindow(processName: window.processName, title: window.title)
+            // The popover may have been closed and reopened while this
+            // `osascript` call was in flight — see `generation`'s doc
+            // comment. If so, this result belongs to a session that's no
+            // longer current, so leave the new popover's state alone.
+            guard requestGeneration == generation else { return }
             statusMessage = "\(window.title) をフォーカスしました"
+            onSessionOpened?()
         } catch {
+            guard requestGeneration == generation else { return }
             statusMessage = "フォーカス失敗: \(error.localizedDescription)"
         }
     }
@@ -278,12 +310,17 @@ final class SessionListViewModel: ObservableObject {
     }
 
     func open(_ session: ProjectSession, with editor: EditorDef) async {
+        let requestGeneration = generation
         statusMessage = "\(editor.name) で開いています…"
         do {
             try WindowController.openInEditor(appName: editor.appName, path: session.path)
             PreferenceStore.setPreferredEditorId(editor.id, forProjectPath: session.path)
+            // See `generation`'s doc comment / `focus(window:)` above.
+            guard requestGeneration == generation else { return }
             statusMessage = "\(editor.name) で開きました"
+            onSessionOpened?()
         } catch {
+            guard requestGeneration == generation else { return }
             statusMessage = "起動失敗: \(error.localizedDescription)"
         }
     }
