@@ -384,9 +384,28 @@ struct SessionListView: View {
             if listTypingMonitor == nil {
                 listTypingMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
                     guard focusTarget == .list,
+                          // `focusTarget == .list` alone isn't enough: it only
+                          // reflects the last focus this view itself set, and
+                          // stays stale at `.list` while `windowPickerView` is
+                          // showing (that view owns its own separate
+                          // `@FocusState`, which this monitor knows nothing
+                          // about). Without this check, characters typed while
+                          // the window picker is up would get silently stolen
+                          // into the main search field instead of reaching the
+                          // picker (PR #15 review).
+                          viewModel.windowPicker == nil,
                           event.modifierFlags.intersection([.command, .control]).isEmpty,
                           !KeyCode.nonCharacterKeys.contains(event.keyCode),
-                          let characters = event.characters, !characters.isEmpty else {
+                          let characters = event.characters, !characters.isEmpty,
+                          // Exclude control characters and AppKit's function-key
+                          // Unicode range (`NSEvent.h`'s NSUpArrowFunctionKey...
+                          // NSModeSwitchFunctionKey, 0xF700–0xF8FF) — Home/End/
+                          // Page Up/Down/F-keys/etc. report non-empty
+                          // `characters` in that range, which isn't real text
+                          // and would otherwise show up as garbage in the
+                          // search field (PR #15 review).
+                          characters.unicodeScalars.allSatisfy({ $0.value >= 0x20 && !(0xF700...0xF8FF).contains($0.value) })
+                    else {
                         return event
                     }
                     viewModel.searchText += characters
