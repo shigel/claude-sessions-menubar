@@ -410,6 +410,30 @@ struct SessionListView: View {
                     }
                     viewModel.searchText += characters
                     focusTarget = .search
+                    // `focusTarget = .search` above makes the search
+                    // TextField become first responder programmatically.
+                    // AppKit's default behavior for a field editor gaining
+                    // first-responder status this way (as opposed to a user
+                    // click, which places the caret where clicked) is to
+                    // select the field's *entire* contents — including the
+                    // character we just appended. Left alone, that shows up
+                    // as "selection looks weird right after typing", and if
+                    // the user's next keystroke lands before they notice,
+                    // it overwrites the whole string instead of extending
+                    // it. Explicitly move the caret to the end (empty
+                    // selection) to restore normal "append while typing"
+                    // behavior.
+                    //
+                    // SwiftUI applies the `@FocusState` change (and AppKit
+                    // actually swaps first responder) on its next view
+                    // update, not necessarily before the next run-loop
+                    // turn — so a single `DispatchQueue.main.async` can run
+                    // too early and see the list still as first responder.
+                    // Use `event.window` (not `NSApp.keyWindow`, which is
+                    // unreliable for this popover/NSPanel-backed window)
+                    // and retry once on the following tick if the field
+                    // editor isn't installed yet.
+                    moveCaretToEndOfSearchField(in: event.window, expecting: viewModel.searchText, attemptsRemaining: 3)
                     // Consumed: the character has already been redirected
                     // into `searchText` above, so letting it also reach the
                     // list (or anything else) would be a double-input.
@@ -427,6 +451,26 @@ struct SessionListView: View {
             }
             listTypingMonitor = nil
         }
+    }
+
+    /// Deselects the search field's text and places the caret at the end,
+    /// undoing AppKit's select-all-on-programmatic-focus behavior triggered
+    /// by `focusTarget = .search` in `listTypingMonitor`. Retries on the
+    /// next run-loop tick (up to `attemptsRemaining` times) because SwiftUI
+    /// may not have swapped AppKit's first responder over to the search
+    /// field's editor yet when this is first called. `expecting` guards
+    /// against acting on a stale field editor whose text no longer matches
+    /// the current search text (e.g. the user kept typing across ticks).
+    private func moveCaretToEndOfSearchField(in window: NSWindow?, expecting text: String, attemptsRemaining: Int) {
+        guard attemptsRemaining > 0 else { return }
+        guard let editor = window?.firstResponder as? NSTextView, editor.string == text else {
+            DispatchQueue.main.async {
+                moveCaretToEndOfSearchField(in: window, expecting: text, attemptsRemaining: attemptsRemaining - 1)
+            }
+            return
+        }
+        let length = (editor.string as NSString).length
+        editor.setSelectedRange(NSRange(location: length, length: 0))
     }
 
     private enum KeyCode {
