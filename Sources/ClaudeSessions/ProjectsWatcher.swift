@@ -17,19 +17,21 @@ import Foundation
 /// changes to entries directly inside the watched directory, not inside its
 /// subdirectories — so it would miss new `.jsonl` files appearing inside
 /// `<project-dir>/`, which is exactly the case this needs to catch.
+///
+/// Lifecycle: callers MUST call `stop()` when done watching — see its doc
+/// comment for why plain deinit isn't enough here.
 final class ProjectsWatcher {
     private var stream: FSEventStreamRef?
     private let onChange: () -> Void
 
-    /// The queue `stream` is scheduled on (see `FSEventStreamSetDispatchQueue`
-    /// in `init`). Apple's docs for `FSEventStreamInvalidate` require it to
-    /// be called on the same run loop/dispatch queue the stream was
-    /// scheduled on — `deinit` itself can run on any thread (here, the main
-    /// thread, when a `@State ProjectsWatcher?` is torn down), so teardown
-    /// is dispatched onto this queue rather than done inline. Without that,
-    /// invalidation racing an in-flight callback on `queue` is a
-    /// use-after-free: the callback holds an unretained `self` pointer.
-    private let queue = DispatchQueue.global(qos: .utility)
+    /// A dedicated SERIAL queue, not `DispatchQueue.global` (which is
+    /// concurrent). `stop()` needs `FSEventStreamInvalidate` to run with a
+    /// happens-before relationship to every already-enqueued/in-flight
+    /// callback, so that once it returns, no callback can still be
+    /// executing or about to start. A concurrent queue can't provide that
+    /// guarantee — two blocks submitted to it may run simultaneously on
+    /// different threads (AI review finding on PR #7).
+    private let queue = DispatchQueue(label: "com.claudesessions.ProjectsWatcher")
 
     /// Coalescing window handed to FSEventStream itself (`latency`), not a
     /// manual debounce timer on our side: the OS already batches bursts of
@@ -48,7 +50,17 @@ final class ProjectsWatcher {
 
         var context = FSEventStreamContext(
             version: 0, info: nil, retain: nil, release: nil, copyDescription: nil)
-        context.info = Unmanaged.passUnretained(self).toOpaque()
+        // `passRetained`, not `passUnretained`: this makes `self` its own
+        // owner for as long as the stream is alive, so the C callback below
+        // can never fire against memory that's mid-deinit or already freed.
+        // The matching release happens in `stop()`, once the stream is
+        // fully invalidated and no further callback can occur — that's also
+        // why `stop()` (not plain `deinit`) is this class's real teardown
+        // entry point (AI review finding on PR #7: a `passUnretained`
+        // context plus async-dispatched teardown left a use-after-free
+        // window between `deinit` starting and the stream actually being
+        // invalidated).
+        context.info = Unmanaged.passRetained(self).toOpaque()
 
         let callback: FSEventStreamCallback = { _, clientCallBackInfo, _, _, _, _ in
             guard let clientCallBackInfo else { return }
@@ -65,6 +77,10 @@ final class ProjectsWatcher {
             Self.latencySeconds,
             UInt32(kFSEventStreamCreateFlagNoDefer)
         ) else {
+            // Creation failed, so nothing will ever call `stop()` to balance
+            // the `passRetained` above — release it here instead, or this
+            // instance leaks permanently.
+            Unmanaged<ProjectsWatcher>.fromOpaque(context.info!).release()
             return nil
         }
         self.stream = stream
@@ -72,16 +88,37 @@ final class ProjectsWatcher {
         FSEventStreamStart(stream)
     }
 
-    deinit {
+    /// Stops watching, synchronously, on the same serial queue the stream is
+    /// scheduled on — so by the time this returns, `onChange` is guaranteed
+    /// not to fire again. Must be called explicitly by the owner before
+    /// dropping its reference: `init` gave `self` an extra retain via the
+    /// FSEvents callback context (see its comment), so a normal ARC
+    /// `deinit` will never run on its own here — this method is what
+    /// releases that retain, and is therefore this class's real
+    /// destructor. Safe to call more than once (e.g. from both an explicit
+    /// `stopWatchingProjects()` and a defensive `deinit`) — the `stream ==
+    /// nil` guard makes every call after the first a no-op.
+    func stop() {
         guard let stream else { return }
-        // Dispatched onto `queue`, not called inline — see the property's
-        // doc comment. `stream` itself is a C pointer (not a class), so
-        // capturing it by value here is safe even though `self` is already
-        // being torn down.
-        queue.async {
+        self.stream = nil
+        queue.sync {
             FSEventStreamStop(stream)
             FSEventStreamInvalidate(stream)
             FSEventStreamRelease(stream)
         }
+        // Balances the `passRetained` in `init`. `passUnretained(self)`
+        // here does NOT take a new retain — it just re-wraps the existing
+        // pointer so `.release()` can hand back the one `init` took.
+        Unmanaged.passUnretained(self).release()
+    }
+
+    deinit {
+        // Reaching here with `stream != nil` means `stop()` was never
+        // called — which should be unreachable, since `init`'s extra retain
+        // keeps this instance alive until `stop()` releases it. Asserting
+        // rather than silently leaking surfaces a caller-discipline bug
+        // (a missing `stopWatchingProjects()` call) instead of hiding it as
+        // a stream that quietly watches forever.
+        assert(stream == nil, "ProjectsWatcher deallocated without calling stop()")
     }
 }
