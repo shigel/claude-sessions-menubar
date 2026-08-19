@@ -72,6 +72,74 @@ final class SessionListViewModel: ObservableObject {
     /// long-lived one.
     private var windowsPrefetchTask: Task<[EditorWindow], Never>?
 
+    /// Watches `~/.claude/projects` for filesystem changes so a session
+    /// created while the popover is already open shows up without the user
+    /// having to close and reopen it (see `ProjectsWatcher`, issue #2).
+    /// Started/stopped by `AppDelegate` from `openPopover()`/`closePopover()`
+    /// (`startWatchingProjects()`/`stopWatchingProjects()` below) rather than
+    /// from this view's `.onAppear`/`.onDisappear`: the popover is hidden via
+    /// `NSWindow.orderOut(_:)`, which does NOT remove the SwiftUI view from
+    /// its hierarchy, so `.onDisappear` never actually fires on close — a
+    /// watcher started that way would run for the entire app lifetime
+    /// instead of only while the popover is visible (AI review finding on
+    /// PR #7).
+    private var projectsWatcher: ProjectsWatcher?
+
+    /// Debounces `ProjectsWatcher` callbacks on top of the 0.5s coalescing
+    /// `ProjectsWatcher` already does at the OS level. An active session
+    /// appends to its jsonl file on every turn, so without this a long
+    /// session left open in the popover would re-trigger `refresh()` — and
+    /// therefore a full `SessionScanner.scan()` — every few seconds. This
+    /// adds a longer, trailing-edge wait so bursts collapse into one
+    /// refresh instead of one per burst tick.
+    private var refreshDebounceTask: Task<Void, Never>?
+
+    /// Bumped by every `refresh()` call. `refresh()` only commits its
+    /// `SessionScanner.scan()` result if this is still the most recent call
+    /// when it finishes — otherwise a slower, older scan (e.g. a background
+    /// `ProjectsWatcher` refresh) could complete after a newer one (e.g. the
+    /// popover's own open-time refresh) and clobber its fresher result with
+    /// stale data, transiently hiding a session that the newer scan had
+    /// already found (AI review finding on PR #7).
+    private var refreshGeneration = 0
+
+    /// Starts watching for filesystem changes. Idempotent — safe to call on
+    /// every `openPopover()` even though the watcher is really only created
+    /// once per app launch in practice (this app never closes and reopens
+    /// the same popover's window instance).
+    func startWatchingProjects() {
+        guard projectsWatcher == nil else { return }
+        projectsWatcher = ProjectsWatcher(paths: [SessionScanner.projectsDir.path]) { [weak self] in
+            // Callback fires on a background queue (see
+            // `FSEventStreamSetDispatchQueue` in `ProjectsWatcher`), so hop
+            // onto the main actor before touching view model state.
+            Task { @MainActor in
+                guard let self else { return }
+                self.refreshDebounceTask?.cancel()
+                self.refreshDebounceTask = Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(2))
+                    guard !Task.isCancelled, let self else { return }
+                    await self.refresh(collapseExpanded: false)
+                }
+            }
+        }
+    }
+
+    /// Stops watching and cancels any pending debounced refresh. Called from
+    /// `closePopover()` so the watcher — and the periodic rescans/`osascript`
+    /// calls it can trigger — don't keep running while the popover is
+    /// hidden.
+    func stopWatchingProjects() {
+        // `.stop()` before dropping the reference — see its doc comment;
+        // `projectsWatcher = nil` alone would leak the watcher forever
+        // (it keeps itself alive via an extra retain until `.stop()`
+        // releases it).
+        projectsWatcher?.stop()
+        projectsWatcher = nil
+        refreshDebounceTask?.cancel()
+        refreshDebounceTask = nil
+    }
+
     /// Incremented every time `refresh()` runs, i.e. every time the popover
     /// opens. `focus(window:)`/`open(_:with:)` capture this at the start of
     /// their (possibly slow, `osascript`-backed) work and compare it again
@@ -81,6 +149,11 @@ final class SessionListViewModel: ObservableObject {
     /// completion — overwrite the new popover's status with stale text and,
     /// worse, call `onSessionOpened` and close the popover the user just
     /// reopened (PR #14 review).
+    ///
+    /// Distinct from `refreshGeneration` above: this one guards
+    /// `focus(window:)`/`open(_:with:)`'s side effects (status message,
+    /// `onSessionOpened`), that one guards `refresh()`'s own result
+    /// (`sessions`) — two different races, bumped by two different events.
     private var generation = 0
 
     struct WindowPickerState: Identifiable {
@@ -163,16 +236,38 @@ final class SessionListViewModel: ObservableObject {
         }
     }
 
-    func refresh() async {
+    /// - Parameter collapseExpanded: true for the popover-open call (the
+    ///   documented "パネルを開くたびに畳む" behavior above), false for a
+    ///   refresh triggered while the popover is already visible — either the
+    ///   `ProjectsWatcher` FSEvents callback or the manual reload
+    ///   button/⌘R. Those must NOT reset `expandedProjects`/`selectedID`,
+    ///   since the whole point is to pick up new sessions quietly while the
+    ///   user is mid-browse; collapsing everything out from under them on
+    ///   every filesystem write would be a worse experience than the stale
+    ///   list this exists to fix (see issue #2).
+    func refresh(collapseExpanded: Bool = true) async {
         isLoading = true
-        expandedProjects.removeAll()
-        // Popover reopened: any in-flight selection from the previous time
-        // it was open is now stale — see `generation`'s doc comment. Also
-        // clear its leftover status message (e.g. "◯◯をフォーカスしました"
-        // from right before the popover closed), which otherwise sits there
-        // until the next selection overwrites it (PR #14 review nit).
-        generation += 1
-        statusMessage = nil
+        if collapseExpanded {
+            expandedProjects.removeAll()
+            // Popover (re)opened: any in-flight selection from the previous
+            // time it was open is now stale — see `generation`'s doc
+            // comment. Also clear its leftover status message (e.g.
+            // "◯◯をフォーカスしました" from right before the popover closed),
+            // which otherwise sits there until the next selection
+            // overwrites it (PR #14 review nit).
+            //
+            // Gated on `collapseExpanded`, NOT unconditional: a
+            // background-triggered refresh (FSEvents, manual reload) must
+            // NOT bump `generation`, or it would invalidate an
+            // `onSessionOpened`-pending `focus(window:)`/`open(_:with:)`
+            // call that's legitimately still in flight for the CURRENT
+            // popover visit — the popover would then fail to close once
+            // that call completes.
+            generation += 1
+            statusMessage = nil
+        }
+        refreshGeneration += 1
+        let thisRefreshGeneration = refreshGeneration
 
         // Start the (slow, osascript-backed) window enumeration in parallel
         // with the session scan, and keep the Task around so
@@ -181,10 +276,27 @@ final class SessionListViewModel: ObservableObject {
         // Cancel any previous prefetch first: window state may have changed
         // since the popover was last open, so we don't want to serve a
         // stale result.
-        windowsPrefetchTask?.cancel()
-        windowsPrefetchTask = Task { await WindowController.listEditorWindows() }
+        //
+        // Only for `collapseExpanded` (real popover-open) calls: a
+        // background-triggered refresh (FSEvents, manual reload) is about
+        // picking up new *session* files, not new editor windows, and
+        // re-running the osascript round-trip on every one — which, during
+        // an active session, can fire every couple of seconds — would spam
+        // System Events for no benefit. The window list from the last
+        // popover-open prefetch stays valid for those.
+        if collapseExpanded {
+            windowsPrefetchTask?.cancel()
+            windowsPrefetchTask = Task { await WindowController.listEditorWindows() }
+        }
 
-        sessions = await SessionScanner.scan()
+        let scanned = await SessionScanner.scan()
+        // A slower, older call (e.g. a background watcher refresh started
+        // before this one) can finish after this one — see `refreshGeneration`'s
+        // doc comment. Drop its result rather than let it clobber fresher
+        // data; `isLoading`/`hasAccessibilityPermission` are harmless either
+        // way, but `sessions` and the selection sync are not.
+        guard thisRefreshGeneration == refreshGeneration else { return }
+        sessions = scanned
         isLoading = false
         hasAccessibilityPermission = WindowController.checkAccessibilityPermission(prompt: false)
         syncSelectionIfNeeded()
@@ -403,6 +515,12 @@ struct SessionListView: View {
             }
             downArrowMonitor = nil
         }
+        // ProjectsWatcher's start/stop deliberately does NOT live here — see
+        // `SessionListViewModel.startWatchingProjects()`'s doc comment for
+        // why `.onAppear`/`.onDisappear` can't be trusted for that (the
+        // popover hides via `orderOut(_:)`, which never triggers
+        // `.onDisappear`). `AppDelegate` drives it instead, from
+        // `openPopover()`/`closePopover()`.
     }
 
     private enum KeyCode {
@@ -436,6 +554,22 @@ struct SessionListView: View {
             if viewModel.isLoading {
                 ProgressView().controlSize(.small)
             }
+            // Explicit escape hatch for issue #2: ProjectsWatcher covers the
+            // common case automatically, but this stays as a deterministic
+            // fallback for anything it misses (e.g. a profile root that
+            // didn't exist yet when the watcher started).
+            // `collapseExpanded: false` for the same reason as the watcher
+            // callback — an explicit reload shouldn't fold the list the user
+            // is looking at.
+            Button {
+                Task { await viewModel.refresh(collapseExpanded: false) }
+            } label: {
+                Image(systemName: "arrow.clockwise")
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(.secondary)
+            .keyboardShortcut("r", modifiers: .command)
+            .help("一覧を再読み込み (⌘R)")
         }
         .padding(8)
     }

@@ -219,6 +219,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                   let button = self.statusItem?.button else { return }
             window.setFrameOrigin(Self.panelOrigin(for: button))
             window.makeKeyAndOrderFront(nil)
+            // Driven from here, not the view's `.onAppear`, because
+            // `.onAppear` only fires once (when the SwiftUI view is first
+            // inserted into the hierarchy) — not on every popover open, since
+            // `closePopover()` hides the window via `orderOut(_:)` rather
+            // than removing the view (see `startWatchingProjects()`'s doc
+            // comment, AI review finding on PR #7).
+            self.sessionListViewModel?.startWatchingProjects()
             Task { [weak self] in
                 await self?.sessionListViewModel?.refresh()
             }
@@ -258,5 +265,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func closePopover() {
         sessionWindow?.orderOut(nil)
+        // `SessionListViewModel` is `@MainActor`-isolated; `closePopover()`
+        // itself isn't, but every call site already runs on the main thread
+        // (AppKit event handlers, `NSApplicationDelegate` callbacks), so
+        // this hop is a formality Swift concurrency requires, not a real
+        // dispatch.
+        Task { @MainActor [weak self] in
+            self?.sessionListViewModel?.stopWatchingProjects()
+        }
     }
 }
