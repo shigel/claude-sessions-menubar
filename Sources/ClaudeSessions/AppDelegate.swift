@@ -1,5 +1,6 @@
 import AppKit
 import IOKit.hid
+import ServiceManagement
 import SwiftUI
 
 /// Transparent overlay placed on top of the status bar button that intercepts
@@ -184,6 +185,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
             menu.addItem(.separator())
         }
+        let loginItem = NSMenuItem(
+            title: "ログイン時に起動", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        loginItem.target = self
+        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        menu.addItem(loginItem)
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "終了", action: #selector(quitApp), keyEquivalent: "q"))
         statusItem?.menu = menu
         statusItem?.button?.performClick(nil)
@@ -202,6 +209,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quitApp() {
         NSApp.terminate(nil)
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+        } catch {
+            NSLog("ClaudeSessions: failed to toggle login item: \(error)")
+            // NSLog alone is invisible to the user: the menu checkbox will
+            // silently stay in its old state with no indication why (AI
+            // review finding on PR #6). An alert is heavyweight for a menu
+            // action, but registration failures here are rare enough
+            // (SMAppService typically only errors on sandboxing/signing
+            // issues) that surfacing them beats a checkbox that mysteriously
+            // doesn't stick.
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "ログイン時の起動設定を変更できませんでした"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
     }
 
     private func openPopover() {
