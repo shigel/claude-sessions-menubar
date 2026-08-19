@@ -75,6 +75,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.statusItem = statusItem
 
         let viewModel = SessionListViewModel()
+        // issue #9: close the popover once a session was actually opened, so
+        // it doesn't stay open (blocking the global shortcut from reopening
+        // it) after the user has already navigated away to the editor.
+        viewModel.onSessionOpened = { [weak self] in self?.closePopover() }
         self.sessionListViewModel = viewModel
         let view = SessionListView(viewModel: viewModel)
         let hostingView = NSHostingView(rootView: view)
