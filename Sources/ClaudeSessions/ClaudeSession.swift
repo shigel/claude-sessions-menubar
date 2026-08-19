@@ -59,7 +59,11 @@ struct ClaudeSession: Identifiable, Equatable, Hashable {
     /// the session was recorded in.
     let profileLabel: String?
 
-    var id: String { sessionId }
+    // `fileURL.path`, not `sessionId` — see `sessionId`'s doc comment above:
+    // it's not unique across profiles, so using it here would contradict
+    // `Identifiable`'s contract the same way it would have for `RowID`
+    // (AI review nit on PR #6).
+    var id: String { fileURL.path }
     /// Short form for degraded display, e.g. "f909915e".
     var shortId: String { String(sessionId.prefix(8)) }
 }
