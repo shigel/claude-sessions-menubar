@@ -225,6 +225,17 @@ final class SessionListViewModel: ObservableObject {
         visibleRows.first { $0.id == id }
     }
 
+    /// Opens whichever row is currently selected (`selectedID`), if any.
+    /// Shared by the list's `.onKeyPress(.return)` and the search field's
+    /// `.onSubmit` (issue #8), so Enter opens the selected row the same way
+    /// regardless of which of the two controls currently has keyboard focus.
+    @discardableResult
+    func openSelectedRow() -> Bool {
+        guard let id = selectedID, let row = row(for: id) else { return false }
+        Task { await selectSession(row.project) }
+        return true
+    }
+
     func toggleExpansion(_ path: String) {
         if expandedProjects.contains(path) {
             collapse(path)
@@ -354,6 +365,16 @@ struct SessionListView: View {
     /// every keystroke; we only piggyback on the down-arrow to move focus.
     @State private var downArrowMonitor: Any?
 
+    /// AppKit-level monitor for character key presses while the list has
+    /// focus, redirecting them into the search field (issue #8). Unlike
+    /// `downArrowMonitor`, which lets its key event pass through unmodified,
+    /// this one consumes the event and appends its characters to
+    /// `searchText` directly: a `@FocusState` change made here would not
+    /// take effect within the same run-loop turn, so simply moving focus and
+    /// letting the keystroke pass through would drop the character instead
+    /// of landing it in the now-focused field.
+    @State private var listTypingMonitor: Any?
+
     var body: some View {
         VStack(spacing: 0) {
             if !viewModel.hasAccessibilityPermission {
@@ -385,16 +406,76 @@ struct SessionListView: View {
             focusTarget = .search
         }
         .onAppear {
-            guard downArrowMonitor == nil else { return }
-            downArrowMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-                guard event.keyCode == KeyCode.downArrow, focusTarget == .search else { return event }
-                guard !viewModel.visibleRows.isEmpty else { return event }
-                viewModel.syncSelectionIfNeeded()
-                focusTarget = .list
-                // Always pass the event through: this monitor only ever
-                // observes, never consumes, so it can't block character
-                // input reaching the TextField.
-                return event
+            if downArrowMonitor == nil {
+                downArrowMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                    guard event.keyCode == KeyCode.downArrow, focusTarget == .search else { return event }
+                    guard !viewModel.visibleRows.isEmpty else { return event }
+                    viewModel.syncSelectionIfNeeded()
+                    focusTarget = .list
+                    // Always pass the event through: this monitor only ever
+                    // observes, never consumes, so it can't block character
+                    // input reaching the TextField.
+                    return event
+                }
+            }
+            if listTypingMonitor == nil {
+                listTypingMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                    guard focusTarget == .list,
+                          // `focusTarget == .list` alone isn't enough: it only
+                          // reflects the last focus this view itself set, and
+                          // stays stale at `.list` while `windowPickerView` is
+                          // showing (that view owns its own separate
+                          // `@FocusState`, which this monitor knows nothing
+                          // about). Without this check, characters typed while
+                          // the window picker is up would get silently stolen
+                          // into the main search field instead of reaching the
+                          // picker (PR #15 review).
+                          viewModel.windowPicker == nil,
+                          event.modifierFlags.intersection([.command, .control]).isEmpty,
+                          !KeyCode.nonCharacterKeys.contains(event.keyCode),
+                          let characters = event.characters, !characters.isEmpty,
+                          // Exclude control characters and AppKit's function-key
+                          // Unicode range (`NSEvent.h`'s NSUpArrowFunctionKey...
+                          // NSModeSwitchFunctionKey, 0xF700–0xF8FF) — Home/End/
+                          // Page Up/Down/F-keys/etc. report non-empty
+                          // `characters` in that range, which isn't real text
+                          // and would otherwise show up as garbage in the
+                          // search field (PR #15 review).
+                          characters.unicodeScalars.allSatisfy({ $0.value >= 0x20 && !(0xF700...0xF8FF).contains($0.value) })
+                    else {
+                        return event
+                    }
+                    viewModel.searchText += characters
+                    focusTarget = .search
+                    // `focusTarget = .search` above makes the search
+                    // TextField become first responder programmatically.
+                    // AppKit's default behavior for a field editor gaining
+                    // first-responder status this way (as opposed to a user
+                    // click, which places the caret where clicked) is to
+                    // select the field's *entire* contents — including the
+                    // character we just appended. Left alone, that shows up
+                    // as "selection looks weird right after typing", and if
+                    // the user's next keystroke lands before they notice,
+                    // it overwrites the whole string instead of extending
+                    // it. Explicitly move the caret to the end (empty
+                    // selection) to restore normal "append while typing"
+                    // behavior.
+                    //
+                    // SwiftUI applies the `@FocusState` change (and AppKit
+                    // actually swaps first responder) on its next view
+                    // update, not necessarily before the next run-loop
+                    // turn — so a single `DispatchQueue.main.async` can run
+                    // too early and see the list still as first responder.
+                    // Use `event.window` (not `NSApp.keyWindow`, which is
+                    // unreliable for this popover/NSPanel-backed window)
+                    // and retry once on the following tick if the field
+                    // editor isn't installed yet.
+                    moveCaretToEndOfSearchField(in: event.window, expecting: viewModel.searchText, attemptsRemaining: 3)
+                    // Consumed: the character has already been redirected
+                    // into `searchText` above, so letting it also reach the
+                    // list (or anything else) would be a double-input.
+                    return nil
+                }
             }
         }
         .onDisappear {
@@ -402,12 +483,51 @@ struct SessionListView: View {
                 NSEvent.removeMonitor(downArrowMonitor)
             }
             downArrowMonitor = nil
+            if let listTypingMonitor {
+                NSEvent.removeMonitor(listTypingMonitor)
+            }
+            listTypingMonitor = nil
         }
+    }
+
+    /// Deselects the search field's text and places the caret at the end,
+    /// undoing AppKit's select-all-on-programmatic-focus behavior triggered
+    /// by `focusTarget = .search` in `listTypingMonitor`. Retries on the
+    /// next run-loop tick (up to `attemptsRemaining` times) because SwiftUI
+    /// may not have swapped AppKit's first responder over to the search
+    /// field's editor yet when this is first called. `expecting` guards
+    /// against acting on a stale field editor whose text no longer matches
+    /// the current search text (e.g. the user kept typing across ticks).
+    private func moveCaretToEndOfSearchField(in window: NSWindow?, expecting text: String, attemptsRemaining: Int) {
+        guard attemptsRemaining > 0 else { return }
+        guard let editor = window?.firstResponder as? NSTextView, editor.string == text else {
+            DispatchQueue.main.async {
+                moveCaretToEndOfSearchField(in: window, expecting: text, attemptsRemaining: attemptsRemaining - 1)
+            }
+            return
+        }
+        let length = (editor.string as NSString).length
+        editor.setSelectedRange(NSRange(location: length, length: 0))
     }
 
     private enum KeyCode {
         /// Virtual keycode for the down-arrow key.
         static let downArrow: UInt16 = 125
+        /// Keycodes `listTypingMonitor` must leave alone — navigation/editing
+        /// keys the list already handles itself (via `.onKeyPress` above, or
+        /// `List`'s own default behavior) rather than redirecting to search.
+        static let nonCharacterKeys: Set<UInt16> = [
+            125, // down arrow
+            126, // up arrow
+            123, // left arrow
+            124, // right arrow
+            36,  // return
+            76,  // keypad enter
+            53,  // escape
+            48,  // tab
+            51,  // delete/backspace
+            117, // forward delete
+        ]
     }
 
     private var accessibilityBanner: some View {
@@ -433,6 +553,17 @@ struct SessionListView: View {
             TextField("プロジェクトを検索…", text: $viewModel.searchText)
                 .textFieldStyle(.plain)
                 .focused($focusTarget, equals: .search)
+                .onSubmit {
+                    // issue #8: Enter while the search field has focus opens
+                    // the currently selected row, same as Enter does when
+                    // the list itself has focus. `.onSubmit` (rather than
+                    // `.onKeyPress(.return)`) is deliberate here — attaching
+                    // `.onKeyPress` directly to a `TextField` is the exact
+                    // failure mode `downArrowMonitor`'s doc comment warns
+                    // about (breaks IME composition); `.onSubmit` only fires
+                    // once Return has actually committed the field.
+                    viewModel.openSelectedRow()
+                }
             if viewModel.isLoading {
                 ProgressView().controlSize(.small)
             }
@@ -450,9 +581,7 @@ struct SessionListView: View {
         .listStyle(.plain)
         .focused($focusTarget, equals: .list)
         .onKeyPress(.return) {
-            guard let id = viewModel.selectedID, let row = viewModel.row(for: id) else { return .ignored }
-            Task { await viewModel.selectSession(row.project) }
-            return .handled
+            viewModel.openSelectedRow() ? .handled : .ignored
         }
         // Left/right arrow handling is safe as `.onKeyPress` on `List` for
         // the same reason `.onKeyPress(.return)` above already was: the
