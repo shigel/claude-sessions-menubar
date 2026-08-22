@@ -83,6 +83,21 @@ final class SessionListViewModel: ObservableObject {
     /// reopened (PR #14 review).
     private var generation = 0
 
+    /// Guards `selectSession(_:)` against re-entrant calls (issue #16).
+    /// A double-click registers as two independent single-tap gestures, and
+    /// two consecutive Enter presses each start their own `Task`, so without
+    /// this a second `selectSession` call can begin while the first is still
+    /// awaiting `WindowController.listEditorWindows()`/`focusWindow` — at
+    /// that point the editor window the first call is about to focus (or is
+    /// still launching) doesn't exist yet from the second call's point of
+    /// view, so the second call falls through to "open a new window"
+    /// instead of finding the one the first call already handled. Set at
+    /// the very start of `selectSession(_:)` and cleared once it fully
+    /// resolves (focused, launched, or handed off to the window picker), so
+    /// a legitimate follow-up selection made after the previous one settled
+    /// is never blocked.
+    private var isSelectingSession = false
+
     struct WindowPickerState: Identifiable {
         let id = UUID()
         let session: ProjectSession
@@ -265,6 +280,13 @@ final class SessionListViewModel: ObservableObject {
     /// - no match -> open with the remembered/default editor
     /// - multiple matches -> let the user pick which window to focus
     func selectSession(_ session: ProjectSession) async {
+        // Re-entrancy guard (issue #16) — see `isSelectingSession`'s doc
+        // comment. A second call arriving while one is already in flight is
+        // silently dropped rather than racing it.
+        guard !isSelectingSession else { return }
+        isSelectingSession = true
+        defer { isSelectingSession = false }
+
         statusMessage = "ウィンドウを検索中…"
         // Await the prefetch started in `refresh()` rather than kicking off
         // a fresh AppleScript call here: by the time the user has picked a
