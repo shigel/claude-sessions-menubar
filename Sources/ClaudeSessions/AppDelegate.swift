@@ -157,9 +157,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DistributedNotificationCenter.default().removeObserver(self)
     }
 
+    /// `.deviceIndependentFlagsMask` minus `.capsLock`. CapsLock being on
+    /// shouldn't affect whether ⌥⌘K is recognized as the hotkey (issue #19):
+    /// masking with the full `.deviceIndependentFlagsMask` would fold
+    /// `.capsLock` into the comparison and make `event.modifierFlags`
+    /// include it whenever the key is toggled on, so it would never equal
+    /// `hotKeyModifiers` (which intentionally omits `.capsLock`).
+    private static let hotKeyMatchMask: NSEvent.ModifierFlags = {
+        var mask = NSEvent.ModifierFlags.deviceIndependentFlagsMask
+        mask.remove(.capsLock)
+        return mask
+    }()
+
     private static func isHotKey(_ event: NSEvent) -> Bool {
         event.keyCode == hotKeyCode
-            && event.modifierFlags.intersection(.deviceIndependentFlagsMask) == hotKeyModifiers
+            && event.modifierFlags.intersection(hotKeyMatchMask) == hotKeyModifiers
     }
 
     @objc private func handleShowPopoverNotification() {
