@@ -78,6 +78,17 @@ enum SessionScanner {
         static let tailEscalatedBytes = 256 * 1024
     }
 
+    /// Every discovered profile's `projects` root, exposed (not `private`)
+    /// so `ProjectsWatcher` can watch the same roots this scanner reads from
+    /// without duplicating the path construction. Recomputed on each call
+    /// (not cached) for the same reason `scanSync()` re-discovers profiles
+    /// every scan — a profile added after launch (or after the watcher was
+    /// last started) should be picked up without restarting the app.
+    static var watchedProjectsDirs: [URL] {
+        ClaudeProfile.discover().map(\.projectsDir)
+    }
+
+
     /// A jsonl file discovered on disk, before its content is parsed.
     private struct FileEntry {
         let url: URL
