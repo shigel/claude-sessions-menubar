@@ -30,12 +30,24 @@ struct ProjectSession: Identifiable, Equatable {
     /// a lone session has nothing to disambiguate, so showing an always-empty
     /// chevron next to it would just be visual noise.
     var isExpandable: Bool { sessions.count > 1 }
+
+    /// Distinct non-default profile labels among `sessions`. Needed because
+    /// a single-session project never renders a child row (see
+    /// `isExpandable`), so a project living only in a non-default profile
+    /// would otherwise have nowhere to show which profile it came from.
+    var profileLabels: Set<String> { Set(sessions.compactMap(\.profileLabel)) }
 }
 
-/// Scans ~/.claude/projects/<encoded-dir>/*.jsonl, extracts the `cwd` field
-/// from each session log, groups sessions by cwd into one `ProjectSession`
-/// per project (every session survives as a child, none are discarded), and
-/// returns the list sorted by most recent activity first.
+/// Scans <profile>/projects/<encoded-dir>/*.jsonl across every discovered
+/// Claude Code config directory (see `ClaudeProfile`), extracts the `cwd`
+/// field from each session log, groups sessions by cwd into one
+/// `ProjectSession` per project (every session survives as a child, none are
+/// discarded), and returns the list sorted by most recent activity first.
+///
+/// Grouping is by `cwd` alone, so a project that exists in more than one
+/// profile lands in a single row: the editor window such a row focuses is
+/// the same one regardless of which profile recorded the session. The
+/// profile survives on each `ClaudeSession` as a display-only label.
 ///
 /// The <encoded-dir> directory name is NOT decoded back into a path: the
 /// `/` -> `-` encoding is lossy (collides with existing hyphens/underscores),
@@ -66,17 +78,13 @@ enum SessionScanner {
         static let tailEscalatedBytes = 256 * 1024
     }
 
-    private static var projectsDir: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude")
-            .appendingPathComponent("projects")
-    }
-
     /// A jsonl file discovered on disk, before its content is parsed.
     private struct FileEntry {
         let url: URL
         let mtime: Date
         let size: Int
+        /// The profile this file was found under; nil for the default one.
+        let profileLabel: String?
     }
 
     /// Per-file cache, keyed by mtime AND size so an append within the same
@@ -104,37 +112,49 @@ enum SessionScanner {
 
     private static func scanSync() -> [ProjectSession] {
         let fm = FileManager.default
-        let root = projectsDir
-        guard fm.fileExists(atPath: root.path) else { return [] }
 
-        guard let projectDirs = try? fm.contentsOfDirectory(
-            at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
-
+        // Rediscovered on every scan rather than cached for the process
+        // lifetime: it costs one directory listing plus a couple of stats,
+        // and in exchange a newly created profile shows up without having to
+        // restart the app.
         var fileEntries: [FileEntry] = []
-        for dirURL in projectDirs {
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: dirURL.path, isDirectory: &isDir), isDir.boolValue else { continue }
-
-            // Non-recursive: only *.jsonl directly inside <projDir> are real
-            // sessions. <projDir>/<sessionId>/subagents/** holds sub-agent
-            // transcripts, not sessions, and contentsOfDirectory here never
-            // descends into them.
-            guard let files = try? fm.contentsOfDirectory(
-                at: dirURL, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]
+        for profile in ClaudeProfile.discover() {
+            let root = profile.projectsDir
+            // `continue`, not `return []`: one unreadable profile root
+            // (permissions, a broken symlink) must not blank out the whole
+            // list, only its own sessions.
+            guard fm.fileExists(atPath: root.path) else { continue }
+            guard let projectDirs = try? fm.contentsOfDirectory(
+                at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
             ) else {
                 continue
             }
 
-            for fileURL in files where fileURL.pathExtension == "jsonl" {
-                guard let attrs = try? fm.attributesOfItem(atPath: fileURL.path),
-                      let mtime = attrs[.modificationDate] as? Date else {
+            for dirURL in projectDirs {
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: dirURL.path, isDirectory: &isDir), isDir.boolValue else { continue }
+
+                // Non-recursive: only *.jsonl directly inside <projDir> are
+                // real sessions. <projDir>/<sessionId>/subagents/** holds
+                // sub-agent transcripts, not sessions, and
+                // contentsOfDirectory here never descends into them. Adding
+                // the profile loop above adds exactly one level at the top
+                // and leaves this property intact.
+                guard let files = try? fm.contentsOfDirectory(
+                    at: dirURL, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]
+                ) else {
                     continue
                 }
-                let size = (attrs[.size] as? Int) ?? 0
-                fileEntries.append(FileEntry(url: fileURL, mtime: mtime, size: size))
+
+                for fileURL in files where fileURL.pathExtension == "jsonl" {
+                    guard let attrs = try? fm.attributesOfItem(atPath: fileURL.path),
+                          let mtime = attrs[.modificationDate] as? Date else {
+                        continue
+                    }
+                    let size = (attrs[.size] as? Int) ?? 0
+                    fileEntries.append(
+                        FileEntry(url: fileURL, mtime: mtime, size: size, profileLabel: profile.label))
+                }
             }
         }
 
@@ -150,6 +170,10 @@ enum SessionScanner {
                 buffer[index] = buildSession(for: fileEntries[index])
             }
         }
+        // Pruned once, against the union of every profile's files — NOT once
+        // per profile inside the loop above. Per-profile pruning would treat
+        // the other profiles' entries as vanished files and evict them on
+        // every iteration, leaving the cache permanently cold.
         pruneCache(keeping: fileEntries.map(\.url))
 
         // Group every session (one per jsonl file) by its cwd first, then
@@ -201,7 +225,8 @@ enum SessionScanner {
             title: title,
             titleSource: titleSource,
             entrypoint: metadata.entrypoint,
-            isBackground: metadata.isBackground
+            isBackground: metadata.isBackground,
+            profileLabel: entry.profileLabel
         )
         storeCache(session: session, entry: entry)
         return session
