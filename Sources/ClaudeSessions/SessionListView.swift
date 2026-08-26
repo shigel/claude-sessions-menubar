@@ -397,6 +397,17 @@ struct SessionListView: View {
     /// of landing it in the now-focused field.
     @State private var listTypingMonitor: Any?
 
+    /// AppKit-level monitor for Cmd+A while the search field has focus
+    /// (issue #24). This app has no `NSApp.mainMenu` (no Edit menu item
+    /// bound to `selectAll:` with a Cmd+A key equivalent) — the usual
+    /// mechanism by which Cmd+A reaches a focused text field's
+    /// `selectAll:` action in an ordinary AppKit app — so without this,
+    /// Cmd+A silently does nothing while the search `TextField` has focus.
+    /// Only intercepts Cmd+A specifically (and only while `focusTarget ==
+    /// .search`); every other key passes through untouched, so this can't
+    /// interfere with `downArrowMonitor`/`listTypingMonitor` above.
+    @State private var selectAllMonitor: Any?
+
     var body: some View {
         VStack(spacing: 0) {
             if !viewModel.hasAccessibilityPermission {
@@ -499,6 +510,29 @@ struct SessionListView: View {
                     return nil
                 }
             }
+            if selectAllMonitor == nil {
+                selectAllMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                    guard focusTarget == .search else { return event }
+                    // Match modifiers the same way AppDelegate.isHotKey(_:)
+                    // does for the global shortcut (issue #19): mask out
+                    // `.capsLock` so a Cmd+A press still registers as plain
+                    // Cmd+A while Caps Lock happens to be on.
+                    let mask = NSEvent.ModifierFlags.deviceIndependentFlagsMask.subtracting(.capsLock)
+                    guard event.modifierFlags.intersection(mask) == .command,
+                          event.charactersIgnoringModifiers?.lowercased() == "a" else {
+                        return event
+                    }
+                    // Send the standard `selectAll:` action message up the
+                    // responder chain with a nil target, exactly what an
+                    // Edit menu's "Select All" item (key-equivalent Cmd+A)
+                    // would do — this reaches the search field's field
+                    // editor (first responder) and selects its text,
+                    // without this menu-bar-only app needing an
+                    // `NSApp.mainMenu` just to make Cmd+A work.
+                    NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)
+                    return nil
+                }
+            }
         }
         .onDisappear {
             if let downArrowMonitor {
@@ -509,6 +543,10 @@ struct SessionListView: View {
                 NSEvent.removeMonitor(listTypingMonitor)
             }
             listTypingMonitor = nil
+            if let selectAllMonitor {
+                NSEvent.removeMonitor(selectAllMonitor)
+            }
+            selectAllMonitor = nil
         }
     }
 
