@@ -3,17 +3,22 @@ import Foundation
 /// A project directory that has one or more Claude Code sessions logged
 /// under it, derived from ~/.claude/projects/*/*.jsonl.
 struct ProjectSession: Identifiable, Equatable {
-    /// Absolute project path, taken verbatim from the jsonl `cwd` field.
+    /// Absolute project path. Usually taken verbatim from the jsonl `cwd`
+    /// field, but for a session whose `cwd` is a `git worktree` checkout
+    /// this is instead the *main* checkout's path — see
+    /// `SessionScanner.projectRoot(for:)` (issue #23) — so worktree
+    /// sessions group under the same `ProjectSession` as the repo they
+    /// belong to rather than forming their own single-session entry.
     let path: String
-    /// Most recent mtime across all jsonl files that resolved to this cwd.
+    /// Most recent mtime across all jsonl files that resolved to this path.
     /// Equal to `sessions.first?.lastActive` since `sessions` is sorted
     /// most-recent-first.
     let lastActive: Date
     /// Whether the directory still exists on disk.
     let exists: Bool
-    /// All sessions filed under this cwd, sorted by `lastActive` descending.
-    /// Guaranteed non-empty — a cwd with zero sessions never produces a
-    /// `ProjectSession` in the first place.
+    /// All sessions filed under this path, sorted by `lastActive`
+    /// descending. Guaranteed non-empty — a path with zero sessions never
+    /// produces a `ProjectSession` in the first place.
     let sessions: [ClaudeSession]
 
     var id: String { path }
@@ -40,14 +45,18 @@ struct ProjectSession: Identifiable, Equatable {
 
 /// Scans <profile>/projects/<encoded-dir>/*.jsonl across every discovered
 /// Claude Code config directory (see `ClaudeProfile`), extracts the `cwd`
-/// field from each session log, groups sessions by cwd into one
-/// `ProjectSession` per project (every session survives as a child, none are
-/// discarded), and returns the list sorted by most recent activity first.
+/// field from each session log, groups sessions by project root (`cwd`,
+/// resolved through `projectRoot(for:)` to fold `git worktree` checkouts
+/// into their main checkout — issue #23) into one `ProjectSession` per
+/// project (every session survives as a child, none are discarded), and
+/// returns the list sorted by most recent activity first.
 ///
-/// Grouping is by `cwd` alone, so a project that exists in more than one
-/// profile lands in a single row: the editor window such a row focuses is
-/// the same one regardless of which profile recorded the session. The
-/// profile survives on each `ClaudeSession` as a display-only label.
+/// Grouping is by resolved project root alone, so a project that exists in
+/// more than one profile (or is checked out as a worktree alongside its main
+/// checkout) lands in a single row: the editor window such a row focuses is
+/// the same one regardless of which profile recorded the session or which
+/// checkout it ran in. The profile survives on each `ClaudeSession` as a
+/// display-only label.
 ///
 /// The <encoded-dir> directory name is NOT decoded back into a path: the
 /// `/` -> `-` encoding is lossy (collides with existing hyphens/underscores),
@@ -112,6 +121,16 @@ enum SessionScanner {
 
     private static var cache: [URL: CacheEntry] = [:]
     private static let cacheLock = NSLock()
+
+    /// Resolved project root per `cwd`, keyed by the raw `cwd` string
+    /// (issue #23). Unlike `cache`, this has no mtime/size invalidation:
+    /// a directory's identity as "the main checkout" vs. "a worktree of
+    /// some other checkout" essentially never changes during the life of
+    /// the running app, so a stale entry is not a realistic concern and a
+    /// simple grow-forever cache avoids re-spawning `git` on every scan
+    /// (the popover re-scans on every open).
+    private static var gitRootCache: [String: String] = [:]
+    private static let gitRootCacheLock = NSLock()
 
     static func scan() async -> [ProjectSession] {
         await withCheckedContinuation { continuation in
@@ -187,23 +206,36 @@ enum SessionScanner {
         // every iteration, leaving the cache permanently cold.
         pruneCache(keeping: fileEntries.map(\.url))
 
-        // Group every session (one per jsonl file) by its cwd first, then
-        // fold each group into a single ProjectSession. This replaces the
-        // old byCwd-max-mtime dedup: instead of keeping only the newest
-        // session per cwd and discarding the rest, every session survives
-        // and becomes a child row the UI can expand into.
-        var sessionsByCwd: [String: [ClaudeSession]] = [:]
-        for session in results.compactMap({ $0 }) {
-            sessionsByCwd[session.cwd, default: []].append(session)
+        // Group every session (one per jsonl file) by its *project root*
+        // first, then fold each group into a single ProjectSession. This
+        // replaces the old byCwd-max-mtime dedup: instead of keeping only
+        // the newest session per cwd and discarding the rest, every session
+        // survives and becomes a child row the UI can expand into.
+        //
+        // The project root is not always `session.cwd` verbatim: a `cwd`
+        // inside a `git worktree` resolves (via `projectRoot(for:)`) to the
+        // main repository's path, so worktree sessions land in the same
+        // group as sessions from the primary checkout (issue #23) instead
+        // of forming their own single-session group.
+        let uniqueCwds = Set(results.compactMap { $0?.cwd })
+        var rootsByCwd: [String: String] = [:]
+        for cwd in uniqueCwds {
+            rootsByCwd[cwd] = projectRoot(for: cwd)
         }
 
-        return sessionsByCwd.map { cwd, sessions in
+        var sessionsByRoot: [String: [ClaudeSession]] = [:]
+        for session in results.compactMap({ $0 }) {
+            let root = rootsByCwd[session.cwd] ?? session.cwd
+            sessionsByRoot[root, default: []].append(session)
+        }
+
+        return sessionsByRoot.map { root, sessions in
             let sorted = sessions.sorted { $0.lastActive > $1.lastActive }
             var isDir: ObjCBool = false
-            let exists = fm.fileExists(atPath: cwd, isDirectory: &isDir) && isDir.boolValue
-            // sorted is non-empty here: a cwd only gets an entry in
-            // sessionsByCwd when at least one session was appended to it.
-            return ProjectSession(path: cwd, lastActive: sorted[0].lastActive, exists: exists, sessions: sorted)
+            let exists = fm.fileExists(atPath: root, isDirectory: &isDir) && isDir.boolValue
+            // sorted is non-empty here: a root only gets an entry in
+            // sessionsByRoot when at least one session was appended to it.
+            return ProjectSession(path: root, lastActive: sorted[0].lastActive, exists: exists, sessions: sorted)
         }
         .sorted { $0.lastActive > $1.lastActive }
     }
@@ -288,6 +320,85 @@ enum SessionScanner {
             return cwd
         }
         return nil
+    }
+
+    // MARK: - Git worktree resolution (issue #23)
+
+    /// Resolves `cwd` to the path sessions should actually be grouped
+    /// under: for an ordinary checkout this is `cwd` itself; for a `git
+    /// worktree` checkout it's the *main* checkout's path, so a worktree's
+    /// sessions land in the same `ProjectSession` as the repo they belong
+    /// to instead of forming their own single-session group.
+    ///
+    /// Falls back to returning `cwd` unchanged whenever `git` can't answer
+    /// (not a git repo, directory no longer exists, `git` missing/old) —
+    /// this must never be able to make grouping worse than before this was
+    /// introduced, only better for the worktree case it targets.
+    private static func projectRoot(for cwd: String) -> String {
+        gitRootCacheLock.lock()
+        if let cached = gitRootCache[cwd] {
+            gitRootCacheLock.unlock()
+            return cached
+        }
+        gitRootCacheLock.unlock()
+
+        let resolved = resolveProjectRootUncached(cwd)
+
+        gitRootCacheLock.lock()
+        gitRootCache[cwd] = resolved
+        gitRootCacheLock.unlock()
+        return resolved
+    }
+
+    private static func resolveProjectRootUncached(_ cwd: String) -> String {
+        // `--path-format=absolute` (git >= 2.31) makes the output usable
+        // regardless of `cwd`'s relationship to the process's own working
+        // directory; `--git-common-dir` (as opposed to `--git-dir`) is what
+        // makes this worktree-aware — for a worktree checkout it points at
+        // the *main* checkout's `.git`, not the worktree-private one under
+        // `.git/worktrees/<name>`. For an ordinary (non-worktree) checkout
+        // it simply points at that same checkout's own `.git`, so
+        // `commonDir`'s parent equals `cwd` and this is a no-op.
+        guard let output = try? runGit(
+            ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"]
+        ) else {
+            return cwd
+        }
+        let commonDirPath = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !commonDirPath.isEmpty else { return cwd }
+
+        let commonDirURL = URL(fileURLWithPath: commonDirPath)
+        // A bare repository's common dir doesn't end in `.git` (it *is* the
+        // repo directory) — that layout isn't the worktree case this issue
+        // is about, so leave `cwd` alone rather than guessing.
+        guard commonDirURL.lastPathComponent == ".git" else { return cwd }
+        return commonDirURL.deletingLastPathComponent().path
+    }
+
+    private struct GitCommandFailed: Error {}
+
+    /// Runs `git` with the given arguments and returns its stdout. Throws
+    /// (and callers should treat that as "leave `cwd` unresolved") on a
+    /// non-zero exit — e.g. `cwd` is not inside a git repository at all,
+    /// which is an entirely normal case for a project directory.
+    private static func runGit(_ arguments: [String]) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["git"] + arguments
+
+        let stdoutPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = Pipe() // discard; not-a-repo errors are expected/routine
+
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            throw GitCommandFailed()
+        }
+
+        let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8) ?? ""
     }
 
     // MARK: - Title and metadata extraction
