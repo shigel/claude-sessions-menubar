@@ -1,5 +1,6 @@
 import AppKit
 import IOKit.hid
+import ServiceManagement
 import SwiftUI
 
 /// Transparent overlay placed on top of the status bar button that intercepts
@@ -157,9 +158,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DistributedNotificationCenter.default().removeObserver(self)
     }
 
+    /// `.deviceIndependentFlagsMask` minus `.capsLock`. CapsLock being on
+    /// shouldn't affect whether ⌥⌘K is recognized as the hotkey (issue #19):
+    /// masking with the full `.deviceIndependentFlagsMask` would fold
+    /// `.capsLock` into the comparison and make `event.modifierFlags`
+    /// include it whenever the key is toggled on, so it would never equal
+    /// `hotKeyModifiers` (which intentionally omits `.capsLock`).
+    private static let hotKeyMatchMask: NSEvent.ModifierFlags = {
+        var mask = NSEvent.ModifierFlags.deviceIndependentFlagsMask
+        mask.remove(.capsLock)
+        return mask
+    }()
+
     private static func isHotKey(_ event: NSEvent) -> Bool {
         event.keyCode == hotKeyCode
-            && event.modifierFlags.intersection(.deviceIndependentFlagsMask) == hotKeyModifiers
+            && event.modifierFlags.intersection(hotKeyMatchMask) == hotKeyModifiers
     }
 
     @objc private func handleShowPopoverNotification() {
@@ -184,6 +197,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
             menu.addItem(.separator())
         }
+        let loginItem = NSMenuItem(
+            title: "ログイン時に起動", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        loginItem.target = self
+        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        menu.addItem(loginItem)
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "終了", action: #selector(quitApp), keyEquivalent: "q"))
         statusItem?.menu = menu
         statusItem?.button?.performClick(nil)
@@ -204,6 +223,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.terminate(nil)
     }
 
+    @objc private func toggleLaunchAtLogin() {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+        } catch {
+            NSLog("ClaudeSessions: failed to toggle login item: \(error)")
+            // NSLog alone is invisible to the user: the menu checkbox will
+            // silently stay in its old state with no indication why (AI
+            // review finding on PR #6). An alert is heavyweight for a menu
+            // action, but registration failures here are rare enough
+            // (SMAppService typically only errors on sandboxing/signing
+            // issues) that surfacing them beats a checkbox that mysteriously
+            // doesn't stick.
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "ログイン時の起動設定を変更できませんでした"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+    }
+
     private func openPopover() {
         guard let window = sessionWindow, window.isVisible == false, statusItem?.button != nil else { return }
         NSApp.activate(ignoringOtherApps: true)
@@ -219,6 +263,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                   let button = self.statusItem?.button else { return }
             window.setFrameOrigin(Self.panelOrigin(for: button))
             window.makeKeyAndOrderFront(nil)
+            // Driven from here, not the view's `.onAppear`, because
+            // `.onAppear` only fires once (when the SwiftUI view is first
+            // inserted into the hierarchy) — not on every popover open, since
+            // `closePopover()` hides the window via `orderOut(_:)` rather
+            // than removing the view (see `startWatchingProjects()`'s doc
+            // comment, AI review finding on PR #7).
+            self.sessionListViewModel?.startWatchingProjects()
             Task { [weak self] in
                 await self?.sessionListViewModel?.refresh()
             }
@@ -258,5 +309,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func closePopover() {
         sessionWindow?.orderOut(nil)
+        // `SessionListViewModel` is `@MainActor`-isolated; `closePopover()`
+        // itself isn't, but every call site already runs on the main thread
+        // (AppKit event handlers, `NSApplicationDelegate` callbacks), so
+        // this hop is a formality Swift concurrency requires, not a real
+        // dispatch.
+        Task { @MainActor [weak self] in
+            self?.sessionListViewModel?.stopWatchingProjects()
+        }
     }
 }

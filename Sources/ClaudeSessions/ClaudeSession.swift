@@ -7,10 +7,14 @@ import Foundation
 /// sessions and are never represented here — `SessionScanner`'s two-level,
 /// non-recursive directory walk excludes them by construction.
 struct ClaudeSession: Identifiable, Equatable, Hashable {
-    /// Session UUID. Verified equal to the jsonl file's basename for every
-    /// session on disk (a sample of 339 files showed 100% agreement), and
-    /// unique across all project directories, so it is safe to use as a
-    /// `List(selection:)` tag without qualifying it by project.
+    /// Session UUID, equal to the jsonl file's basename for every session
+    /// observed on disk.
+    ///
+    /// NOT assumed unique: profiles are independent config trees, and
+    /// seeding one from another (`cp -r ~/.claude ~/.claude-vanilla`, which
+    /// is exactly what a "compare against a clean profile" workflow does)
+    /// duplicates session ids wholesale. Row identity therefore keys on
+    /// `fileURL` instead, which is unique by construction.
     let sessionId: String
     let fileURL: URL
     /// The project this session is filed under: the FIRST `cwd` seen in the
@@ -48,8 +52,18 @@ struct ClaudeSession: Identifiable, Equatable, Hashable {
     let entrypoint: String?
     /// `sessionKind == "bg"` in the log.
     let isBackground: Bool
+    /// Which Claude Code config directory this session was found under (see
+    /// `ClaudeProfile`); nil for the default `~/.claude`. Display-only — the
+    /// scanner groups by `cwd` regardless of profile, because the editor
+    /// window a project row opens is the same one no matter which profile
+    /// the session was recorded in.
+    let profileLabel: String?
 
-    var id: String { sessionId }
+    // `fileURL.path`, not `sessionId` — see `sessionId`'s doc comment above:
+    // it's not unique across profiles, so using it here would contradict
+    // `Identifiable`'s contract the same way it would have for `RowID`
+    // (AI review nit on PR #6).
+    var id: String { fileURL.path }
     /// Short form for degraded display, e.g. "f909915e".
     var shortId: String { String(sessionId.prefix(8)) }
 }
