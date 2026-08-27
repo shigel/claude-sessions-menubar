@@ -923,10 +923,13 @@ private struct ProjectRow: View {
             // ProjectSession.isExpandable), so one living only in a
             // non-default profile would otherwise show no trace of which
             // profile it came from. Surface it on the project row instead.
+            // This also applies to expandable (multi-session) projects: when
+            // every session in the project shares the same profile, show the
+            // badge on the parent row too, rather than only after expanding.
             // Only when the project is unambiguously from one non-default
-            // profile — a mixed project is expandable, and its children carry
-            // their own badges.
-            if !row.isExpandable, row.project.profileLabels.count == 1,
+            // profile — a mixed project's children carry their own badges
+            // instead.
+            if row.project.profileLabels.count == 1,
                let profileLabel = row.project.profileLabels.first {
                 Text(profileLabel)
                     .font(.caption2)
