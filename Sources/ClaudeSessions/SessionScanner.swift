@@ -36,13 +36,25 @@ struct ProjectSession: Identifiable, Equatable {
     /// `isExpandable`), so a project living only in a non-default profile
     /// would otherwise have nowhere to show which profile it came from.
     var profileLabels: Set<String> { Set(sessions.compactMap(\.profileLabel)) }
+
+    /// Agent badge for a single-session project, for the same reason as
+    /// `profileLabels`: with no child row to carry "codex", the project
+    /// row shows it. nil when the project is expandable (its children
+    /// carry their own badges) or the lone session is unbadged.
+    var loneSessionAgentBadge: String? { isExpandable ? nil : sessions.first?.agent.badge }
 }
 
 /// Scans <profile>/projects/<encoded-dir>/*.jsonl across every discovered
-/// Claude Code config directory (see `ClaudeProfile`), extracts the `cwd`
-/// field from each session log, groups sessions by cwd into one
+/// Claude Code config directory (see `ClaudeProfile`), plus every Codex CLI
+/// rollout under `~/.codex/sessions` (see `CodexSessionParser`), extracts
+/// the `cwd` field from each session log, groups sessions by cwd into one
 /// `ProjectSession` per project (every session survives as a child, none are
 /// discarded), and returns the list sorted by most recent activity first.
+///
+/// Both agents feed the same `fileEntries` list and the same cache, so the
+/// per-scan `pruneCache(keeping:)` sees the union of every file from every
+/// source — pruning per source would evict the other source's entries on
+/// every scan and leave the cache permanently cold.
 ///
 /// Grouping is by `cwd` alone, so a project that exists in more than one
 /// profile lands in a single row: the editor window such a row focuses is
@@ -72,10 +84,32 @@ enum SessionScanner {
     ///   a ONE-TIME escalation, never a fallback to reading the whole file:
     ///   files run up to 40MB, and full reads of the dataset would total
     ///   ~656MB per scan.
+    /// - `codexHeadBytes`: Codex rollouts front-load the entire system
+    ///   prompt into line 1 (`session_meta.payload.base_instructions`), so
+    ///   the first line alone runs ~22KB, up to ~49KB, on the machine this
+    ///   was surveyed on (2026-09, 580 rollouts) — an 8KB window would drop
+    ///   it as a partial line and never find `cwd`. 64KB also reaches the
+    ///   first real user message for the large majority of threads that
+    ///   are missing from `session_index.jsonl`. Codex is a head-only
+    ///   read; there is no tail window because it has no `last-prompt`
+    ///   rung.
+    /// - `codexHeadEscalatedBytes`: the Codex analogue of
+    ///   `tailEscalatedBytes`, used both when line 1 itself overflows the
+    ///   ordinary window and when no title was found in it. Unattended
+    ///   `codex exec` runs inject the AGENTS.md preamble and a
+    ///   `<recommended_plugins>` block ahead of the real prompt, pushing
+    ///   it to ~100KB; 256KB reaches nearly all of those. The threads that
+    ///   still fall through are `codex exec` rollouts whose prompt sits
+    ///   past 256KB, or that carry no user prompt at all. Same rule as the
+    ///   tail: ONE bounded retry, never a full read — Codex rollouts run
+    ///   up to hundreds of MB. (Counts measured with an ad-hoc script over
+    ///   `~/.codex/sessions`; they will drift with the dataset.)
     private enum Window {
         static let headBytes = 8 * 1024
         static let tailBytes = 64 * 1024
         static let tailEscalatedBytes = 256 * 1024
+        static let codexHeadBytes = 64 * 1024
+        static let codexHeadEscalatedBytes = 256 * 1024
     }
 
     /// Every discovered profile's `projects` root, exposed (not `private`)
@@ -85,7 +119,7 @@ enum SessionScanner {
     /// every scan — a profile added after launch (or after the watcher was
     /// last started) should be picked up without restarting the app.
     static var watchedProjectsDirs: [URL] {
-        ClaudeProfile.discover().map(\.projectsDir)
+        ClaudeProfile.discover().map(\.projectsDir) + [CodexSessionParser.sessionsDir]
     }
 
 
@@ -95,7 +129,9 @@ enum SessionScanner {
         let mtime: Date
         let size: Int
         /// The profile this file was found under; nil for the default one.
+        /// Always nil for Codex files — Codex has no profile concept here.
         let profileLabel: String?
+        let agent: Agent
     }
 
     /// Per-file cache, keyed by mtime AND size so an append within the same
@@ -104,10 +140,17 @@ enum SessionScanner {
     /// time it opens, so without this cache every open would re-read and
     /// re-parse the two windows of all ~360 session files even though the
     /// overwhelming majority haven't changed since the last open.
+    ///
+    /// `session` is optional so a file that resolves to nil (a Codex
+    /// sub-agent rollout, a `cwd`-less head) is cached as a tombstone
+    /// under the same key: without that, every scan would re-read and
+    /// re-parse those files (154 of 580 rollouts here) — and with
+    /// `~/.codex/sessions` now FSEvents-watched, an active Codex run keeps
+    /// scans coming while the popover is open.
     private struct CacheEntry {
         let mtime: Date
         let size: Int
-        let session: ClaudeSession
+        let session: ClaudeSession?
     }
 
     private static var cache: [URL: CacheEntry] = [:]
@@ -164,10 +207,28 @@ enum SessionScanner {
                     }
                     let size = (attrs[.size] as? Int) ?? 0
                     fileEntries.append(
-                        FileEntry(url: fileURL, mtime: mtime, size: size, profileLabel: profile.label))
+                        FileEntry(url: fileURL, mtime: mtime, size: size, profileLabel: profile.label, agent: .claudeCode))
                 }
             }
         }
+
+        // Codex rollouts are filed by DATE (`<YYYY>/<MM>/<DD>/`), not by
+        // project, so `cwd` can only come from inside each file — same as
+        // the Claude tree, just with a deeper, fixed-depth directory walk.
+        // Appended to the same list so the concurrent parse and the cache
+        // prune below treat both agents uniformly.
+        for fileURL in CodexSessionParser.rolloutFiles() {
+            guard let attrs = try? fm.attributesOfItem(atPath: fileURL.path),
+                  let mtime = attrs[.modificationDate] as? Date else {
+                continue
+            }
+            let size = (attrs[.size] as? Int) ?? 0
+            fileEntries.append(FileEntry(url: fileURL, mtime: mtime, size: size, profileLabel: nil, agent: .codex))
+        }
+
+        // Loaded once per scan (not per file): ~260 lines, and every Codex
+        // file below consults it for its title.
+        let codexThreadNames = CodexSessionParser.loadThreadNames()
 
         // Parse files concurrently, writing each result to its own fixed
         // index — safe without additional synchronization because no two
@@ -178,7 +239,11 @@ enum SessionScanner {
         var results = [ClaudeSession?](repeating: nil, count: fileEntries.count)
         results.withUnsafeMutableBufferPointer { buffer in
             DispatchQueue.concurrentPerform(iterations: fileEntries.count) { index in
-                buffer[index] = buildSession(for: fileEntries[index])
+                let entry = fileEntries[index]
+                switch entry.agent {
+                case .claudeCode: buffer[index] = buildSession(for: entry)
+                case .codex: buffer[index] = buildCodexSession(for: entry, threadNames: codexThreadNames)
+                }
             }
         }
         // Pruned once, against the union of every profile's files — NOT once
@@ -214,11 +279,14 @@ enum SessionScanner {
     /// behavior of skipping files with no discoverable cwd).
     private static func buildSession(for entry: FileEntry) -> ClaudeSession? {
         if let cached = cachedSession(for: entry) {
-            return cached
+            return cached.session
         }
 
         let headLines = readHeadWindow(entry.url, bytes: Window.headBytes)
-        guard let cwd = extractCwd(from: headLines) else { return nil }
+        guard let cwd = extractCwd(from: headLines) else {
+            storeCache(session: nil, entry: entry)
+            return nil
+        }
 
         // The jsonl basename equals the sessionId field for every session
         // observed on disk, so deriving it from the filename avoids
@@ -236,23 +304,114 @@ enum SessionScanner {
             title: title,
             titleSource: titleSource,
             entrypoint: metadata.entrypoint,
+            isUnattended: metadata.entrypoint == "sdk-cli",
+            isDesktop: metadata.entrypoint == "claude-desktop",
             isBackground: metadata.isBackground,
-            profileLabel: entry.profileLabel
+            profileLabel: entry.profileLabel,
+            agent: .claudeCode
         )
         storeCache(session: session, entry: entry)
         return session
     }
 
-    private static func cachedSession(for entry: FileEntry) -> ClaudeSession? {
+    /// Codex counterpart of `buildSession(for:)`. One head-window read; all
+    /// format knowledge lives in `CodexSessionParser`. Returns nil for
+    /// files with no `cwd` (unparseable line 1) and for sub-agent /
+    /// guardian-review rollouts, which are not user-facing threads — the
+    /// Codex equivalent of the `subagents/**` transcripts the Claude walk
+    /// excludes by never descending into them.
+    private static func buildCodexSession(for entry: FileEntry, threadNames: [String: String]) -> ClaudeSession? {
+        if let cached = cachedSession(for: entry), !isIndexTitleStale(cached.session, threadNames: threadNames) {
+            return cached.session
+        }
+
+        var headLines = readHeadWindow(entry.url, bytes: Window.codexHeadBytes)
+        // Line 1 overflowing the ordinary window comes back as an empty
+        // array (the partial line is dropped), so retry once at the
+        // escalated budget before concluding there is no session_meta —
+        // the system prompt in line 1 grows with Codex releases, and the
+        // first one past 64KB would otherwise make every new thread vanish.
+        if headLines.isEmpty, entry.size > Window.codexHeadBytes {
+            headLines = readHeadWindow(entry.url, bytes: Window.codexHeadEscalatedBytes)
+        }
+        guard let meta = CodexSessionParser.sessionMeta(from: headLines), !meta.isDerivedThread else {
+            storeCache(session: nil, entry: entry)
+            return nil
+        }
+
+        let (title, titleSource) = resolveCodexTitle(
+            entry: entry, meta: meta, headLines: headLines, threadNames: threadNames)
+
+        let session = ClaudeSession(
+            sessionId: meta.sessionId,
+            fileURL: entry.url,
+            cwd: meta.cwd,
+            lastActive: entry.mtime,
+            startedAt: meta.startedAt.flatMap(parseTimestamp),
+            title: title,
+            titleSource: titleSource,
+            entrypoint: meta.originator,
+            isUnattended: meta.isUnattended,
+            isDesktop: meta.isDesktop,
+            isBackground: false,
+            profileLabel: nil,
+            agent: .codex
+        )
+        storeCache(session: session, entry: entry)
+        return session
+    }
+
+    /// Codex title chain: index `thread_name` > first user prompt in the
+    /// head window > one escalated head re-read > session id. The
+    /// escalation only runs when the index had nothing AND the ordinary
+    /// window found nothing AND the file is actually bigger than that
+    /// window — so the common indexed thread costs one read.
+    private static func resolveCodexTitle(
+        entry: FileEntry, meta: CodexSessionParser.SessionMeta, headLines: [Data], threadNames: [String: String]
+    ) -> (String, TitleSource) {
+        if let name = threadNames[meta.sessionId], let sanitized = SessionTitleExtractor.sanitizeTitle(name) {
+            return (sanitized, .threadName)
+        }
+        if let prompt = CodexSessionParser.firstUserPrompt(from: headLines),
+           let sanitized = SessionTitleExtractor.sanitizeTitle(prompt) {
+            return (sanitized, .firstPrompt)
+        }
+        if entry.size > Window.codexHeadBytes {
+            let escalated = readHeadWindow(entry.url, bytes: Window.codexHeadEscalatedBytes)
+            if let prompt = CodexSessionParser.firstUserPrompt(from: escalated),
+               let sanitized = SessionTitleExtractor.sanitizeTitle(prompt) {
+                return (sanitized, .firstPrompt)
+            }
+        }
+        return (ClaudeSession.shortId(meta.sessionId), .sessionId)
+    }
+
+    /// The cache key is the rollout's mtime+size, but a Codex title can
+    /// come from `session_index.jsonl`, a separate file that changes when
+    /// the user renames a thread or when Codex names it after the
+    /// rollout's last append. So a hit is only honored if the index still
+    /// agrees with what was cached: the index has a name and the cached
+    /// title is not that name → stale, rebuild. A tombstone (nil) or a
+    /// Claude Code session is never stale on this axis.
+    private static func isIndexTitleStale(_ session: ClaudeSession?, threadNames: [String: String]) -> Bool {
+        guard let session, session.agent == .codex,
+              let name = threadNames[session.sessionId],
+              let sanitized = SessionTitleExtractor.sanitizeTitle(name) else { return false }
+        return session.titleSource != .threadName || session.title != sanitized
+    }
+
+    /// Returns the cache entry (possibly a tombstone) when the file is
+    /// unchanged; nil when there is no entry or the file changed.
+    private static func cachedSession(for entry: FileEntry) -> CacheEntry? {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         guard let cached = cache[entry.url], cached.mtime == entry.mtime, cached.size == entry.size else {
             return nil
         }
-        return cached.session
+        return cached
     }
 
-    private static func storeCache(session: ClaudeSession, entry: FileEntry) {
+    private static func storeCache(session: ClaudeSession?, entry: FileEntry) {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         cache[entry.url] = CacheEntry(mtime: entry.mtime, size: entry.size, session: session)
@@ -321,7 +480,7 @@ enum SessionScanner {
         }
 
         let sessionId = fileURL.deletingPathExtension().lastPathComponent
-        return (String(sessionId.prefix(8)), .sessionId)
+        return (ClaudeSession.shortId(sessionId), .sessionId)
     }
 
     /// Pulls `entrypoint`, `sessionKind`, and the first `timestamp` out of
