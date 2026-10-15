@@ -356,20 +356,18 @@ final class SessionListViewModel: ObservableObject {
         // data; `isLoading`/`hasAccessibilityPermission` are harmless either
         // way, but `sessions` and the selection sync are not.
         guard thisRefreshGeneration == refreshGeneration else { return }
-        // Captured before `sessions` changes: a selection on the first row
-        // means the user is looking at the newest sessions, so it should
-        // follow the new first row rather than stay anchored while new
-        // rows slide in above it, half hidden (issue #29).
-        let wasOnFirstRow = selectedID != nil && selectedID == visibleRows.first?.id
         sessions = scanned
         isLoading = false
         hasAccessibilityPermission = WindowController.checkAccessibilityPermission(prompt: false)
-        if pendingResetToTop || wasOnFirstRow {
-            // Popover (re)opened, or the user was already at the top: start
-            // from the newest row rather than the one picked earlier, which
-            // may now sit below several new sessions (issue #29). Otherwise
-            // the selection is kept so the cursor doesn't jump while the
-            // user is browsing further down.
+        if pendingResetToTop {
+            // Popover (re)opened: start from the newest row rather than the
+            // one picked last time, which may now sit below several new
+            // sessions (issue #29). Background refreshes keep the selection
+            // and scroll position so the list doesn't jump while the user
+            // is browsing — not even when the selection is on the first
+            // row: selection only moves on click, so a user wheel-scrolling
+            // down still has row one selected, and snapping back to the
+            // top on every ~2s throttled refresh would fight them.
             pendingResetToTop = false
             selectedID = visibleRows.first?.id
             scrollToTopRequest += 1
