@@ -63,11 +63,21 @@ final class SessionListViewModel: ObservableObject {
     /// Which project rows the user has expanded to reveal their session
     /// children, keyed by `ProjectSession.path`. Deliberately reset at the
     /// start of every `refresh()` (see decision "パネルを開くたびに畳む" in
-    /// the plan) — unlike `searchText`/`selectedID`, which keep their
-    /// existing behavior of persisting across popover open/close, expansion
-    /// always starts collapsed so a stale wall of session rows never
-    /// greets the user on reopen.
+    /// the plan) — unlike `searchText`, which persists across popover
+    /// open/close, expansion always starts collapsed so a stale wall of
+    /// session rows never greets the user on reopen. `selectedID` is reset
+    /// too, to the first row (see `scrollToTopRequest`).
     @Published var expandedProjects: Set<String> = []
+
+    /// Bumped once per popover-open `refresh()`, after the fresh scan has
+    /// been committed; the view scrolls the list back to its first row
+    /// whenever this changes (issue #29). The popover is hidden with
+    /// `orderOut(_:)`, not torn down, so the `List` otherwise keeps the
+    /// scroll offset — and the selected row — from the previous visit.
+    /// New sessions are always inserted at the TOP (most recent first), so
+    /// a list left scrolled even a few rows down hides exactly the rows the
+    /// user is most likely looking for.
+    @Published private(set) var scrollToTopRequest = 0
 
     /// Prefetched editor window list, started as soon as the popover opens
     /// (in parallel with the session scan in `refresh()`) so that
@@ -91,14 +101,14 @@ final class SessionListViewModel: ObservableObject {
     /// PR #7).
     private var projectsWatcher: ProjectsWatcher?
 
-    /// Debounces `ProjectsWatcher` callbacks on top of the 0.5s coalescing
-    /// `ProjectsWatcher` already does at the OS level. An active session
-    /// appends to its jsonl file on every turn, so without this a long
-    /// session left open in the popover would re-trigger `refresh()` — and
-    /// therefore a full `SessionScanner.scan()` — every few seconds. This
-    /// adds a longer, trailing-edge wait so bursts collapse into one
-    /// refresh instead of one per burst tick.
-    private var refreshDebounceTask: Task<Void, Never>?
+    /// Throttles `ProjectsWatcher` callbacks on top of the 0.5s coalescing
+    /// `ProjectsWatcher` already does at the OS level: the first event
+    /// schedules one refresh 2s later, and events arriving meanwhile ride
+    /// along with it, so a continuously-written log costs at most one
+    /// `SessionScanner.scan()` per ~2s. Non-nil exactly while a refresh is
+    /// scheduled. (Formerly a restart-on-every-event debounce, which
+    /// starved under continuous writes — issue #29.)
+    private var refreshThrottleTask: Task<Void, Never>?
 
     /// Bumped by every `refresh()` call. `refresh()` only commits its
     /// `SessionScanner.scan()` result if this is still the most recent call
@@ -119,19 +129,27 @@ final class SessionListViewModel: ObservableObject {
             // Callback fires on a background queue (see
             // `FSEventStreamSetDispatchQueue` in `ProjectsWatcher`), so hop
             // onto the main actor before touching view model state.
+            //
+            // Throttle, not debounce (issue #29): a pending refresh is left
+            // alone rather than cancelled and restarted. Any active session
+            // (Claude Code or Codex) appends to its log continuously, so
+            // with a restart-on-every-event debounce the 2s quiet period
+            // never arrives and the open popover never refreshed at all.
+            // Events landing while one is pending are covered by it, since
+            // the scan only starts after the sleep.
             Task { @MainActor in
-                guard let self else { return }
-                self.refreshDebounceTask?.cancel()
-                self.refreshDebounceTask = Task { [weak self] in
+                guard let self, self.refreshThrottleTask == nil else { return }
+                self.refreshThrottleTask = Task { [weak self] in
                     try? await Task.sleep(for: .seconds(2))
                     guard !Task.isCancelled, let self else { return }
+                    self.refreshThrottleTask = nil
                     await self.refresh(collapseExpanded: false)
                 }
             }
         }
     }
 
-    /// Stops watching and cancels any pending debounced refresh. Called from
+    /// Stops watching and cancels any pending throttled refresh. Called from
     /// `closePopover()` so the watcher — and the periodic rescans/`osascript`
     /// calls it can trigger — don't keep running while the popover is
     /// hidden.
@@ -142,8 +160,8 @@ final class SessionListViewModel: ObservableObject {
         // releases it).
         projectsWatcher?.stop()
         projectsWatcher = nil
-        refreshDebounceTask?.cancel()
-        refreshDebounceTask = nil
+        refreshThrottleTask?.cancel()
+        refreshThrottleTask = nil
     }
 
     /// Incremented every time `refresh()` runs, i.e. every time the popover
@@ -329,7 +347,16 @@ final class SessionListViewModel: ObservableObject {
         sessions = scanned
         isLoading = false
         hasAccessibilityPermission = WindowController.checkAccessibilityPermission(prompt: false)
-        syncSelectionIfNeeded()
+        if collapseExpanded {
+            // Popover (re)opened: start from the newest row rather than the
+            // one picked last time, which may now sit below several new
+            // sessions (issue #29). Background refreshes keep the selection
+            // so the cursor doesn't jump while the user is browsing.
+            selectedID = visibleRows.first?.id
+            scrollToTopRequest += 1
+        } else {
+            syncSelectionIfNeeded()
+        }
     }
 
     /// Keeps `selectedID` pointing at a row that's still present in
@@ -742,11 +769,28 @@ struct SessionListView: View {
         .padding(8)
     }
 
+    /// Wraps `sessionListBody` only to get a `ScrollViewReader` proxy for
+    /// the reopen-time scroll-to-top (issue #29). The list's own modifiers
+    /// (`.focused`, `.onKeyPress`) stay on the `List` inside
+    /// `sessionListBody`, not on this wrapper, so focus and key handling
+    /// target the same view they always did.
     private var sessionList: some View {
+        ScrollViewReader { proxy in
+            sessionListBody
+                .onChange(of: viewModel.scrollToTopRequest) {
+                    if let first = viewModel.visibleRows.first?.id {
+                        proxy.scrollTo(first, anchor: .top)
+                    }
+                }
+        }
+    }
+
+    private var sessionListBody: some View {
         List(selection: $viewModel.selectedID) {
             ForEach(viewModel.visibleRows) { row in
                 rowView(for: row)
                     .tag(row.id)
+                    .id(row.id)
             }
         }
         .listStyle(.plain)
