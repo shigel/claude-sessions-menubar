@@ -79,6 +79,14 @@ final class SessionListViewModel: ObservableObject {
     /// user is most likely looking for.
     @Published private(set) var scrollToTopRequest = 0
 
+    /// Set by a popover-open `refresh()` and cleared by whichever refresh
+    /// commits first. The reset-to-top can't live only in the open-time
+    /// call itself: a watcher or ⌘R refresh started while the open-time
+    /// scan is still running supersedes it via `refreshGeneration`, and
+    /// the open-time call then returns without committing — which would
+    /// silently skip the reset and bring issue #29 right back.
+    private var pendingResetToTop = false
+
     /// Prefetched editor window list, started as soon as the popover opens
     /// (in parallel with the session scan in `refresh()`) so that
     /// `selectSession(_:)` doesn't have to pay for the `osascript`
@@ -138,7 +146,10 @@ final class SessionListViewModel: ObservableObject {
             // Events landing while one is pending are covered by it, since
             // the scan only starts after the sleep.
             Task { @MainActor in
-                guard let self, self.refreshThrottleTask == nil else { return }
+                // `projectsWatcher == nil`: this hop was queued before
+                // `stopWatchingProjects()` ran — the popover is closed, so
+                // don't schedule a rescan nobody will see.
+                guard let self, self.projectsWatcher != nil, self.refreshThrottleTask == nil else { return }
                 self.refreshThrottleTask = Task { [weak self] in
                     try? await Task.sleep(for: .seconds(2))
                     guard !Task.isCancelled, let self else { return }
@@ -313,6 +324,7 @@ final class SessionListViewModel: ObservableObject {
             // that call completes.
             generation += 1
             statusMessage = nil
+            pendingResetToTop = true
         }
         refreshGeneration += 1
         let thisRefreshGeneration = refreshGeneration
@@ -344,14 +356,21 @@ final class SessionListViewModel: ObservableObject {
         // data; `isLoading`/`hasAccessibilityPermission` are harmless either
         // way, but `sessions` and the selection sync are not.
         guard thisRefreshGeneration == refreshGeneration else { return }
+        // Captured before `sessions` changes: a selection on the first row
+        // means the user is looking at the newest sessions, so it should
+        // follow the new first row rather than stay anchored while new
+        // rows slide in above it, half hidden (issue #29).
+        let wasOnFirstRow = selectedID != nil && selectedID == visibleRows.first?.id
         sessions = scanned
         isLoading = false
         hasAccessibilityPermission = WindowController.checkAccessibilityPermission(prompt: false)
-        if collapseExpanded {
-            // Popover (re)opened: start from the newest row rather than the
-            // one picked last time, which may now sit below several new
-            // sessions (issue #29). Background refreshes keep the selection
-            // so the cursor doesn't jump while the user is browsing.
+        if pendingResetToTop || wasOnFirstRow {
+            // Popover (re)opened, or the user was already at the top: start
+            // from the newest row rather than the one picked earlier, which
+            // may now sit below several new sessions (issue #29). Otherwise
+            // the selection is kept so the cursor doesn't jump while the
+            // user is browsing further down.
+            pendingResetToTop = false
             selectedID = visibleRows.first?.id
             scrollToTopRequest += 1
         } else {
@@ -778,8 +797,13 @@ struct SessionListView: View {
         ScrollViewReader { proxy in
             sessionListBody
                 .onChange(of: viewModel.scrollToTopRequest) {
-                    if let first = viewModel.visibleRows.first?.id {
-                        proxy.scrollTo(first, anchor: .top)
+                    // Deferred one run-loop turn: the new rows land in the
+                    // same update as this change, and the NSTableView behind
+                    // `List` can ignore a scroll to a row it hasn't laid out.
+                    DispatchQueue.main.async {
+                        if let first = viewModel.visibleRows.first?.id {
+                            proxy.scrollTo(first, anchor: .top)
+                        }
                     }
                 }
         }
