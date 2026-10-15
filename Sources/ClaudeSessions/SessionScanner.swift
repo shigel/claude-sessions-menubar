@@ -70,6 +70,13 @@ enum SessionScanner {
     /// of the real dataset (363 session files):
     /// - `headBytes`: `cwd` was found within 4,478 bytes in every sampled
     ///   file, so 8KB leaves comfortable margin at negligible cost.
+    /// - `headEscalatedBytes`: one bounded retry when `cwd` is NOT in the
+    ///   first 8KB. Newer Claude Code versions open a session with a
+    ///   `queue-operation` line that carries the full first prompt, so a
+    ///   session started with a long pasted prompt pushes `cwd` out of the
+    ///   ordinary window and was silently dropped (issue #29: 9 of 731 files
+    ///   on the surveyed machine, `cwd` at up to ~141KB). Same rule as the
+    ///   other escalations: ONE retry, never a full read.
     /// - `tailBytes`: sweeping the tail window size showed title-material
     ///   coverage (aiTitle/lastPrompt/customTitle) saturates at 64KB —
     ///   doubling to 128KB found zero additional matches. `ai-title` lines
@@ -106,6 +113,7 @@ enum SessionScanner {
     ///   `~/.codex/sessions`; they will drift with the dataset.)
     private enum Window {
         static let headBytes = 8 * 1024
+        static let headEscalatedBytes = 256 * 1024
         static let tailBytes = 64 * 1024
         static let tailEscalatedBytes = 256 * 1024
         static let codexHeadBytes = 64 * 1024
@@ -282,8 +290,13 @@ enum SessionScanner {
             return cached.session
         }
 
-        let headLines = readHeadWindow(entry.url, bytes: Window.headBytes)
-        guard let cwd = extractCwd(from: headLines) else {
+        var headLines = readHeadWindow(entry.url, bytes: Window.headBytes)
+        var foundCwd = extractCwd(from: headLines)
+        if foundCwd == nil, entry.size > Window.headBytes {
+            headLines = readHeadWindow(entry.url, bytes: Window.headEscalatedBytes)
+            foundCwd = extractCwd(from: headLines)
+        }
+        guard let cwd = foundCwd else {
             storeCache(session: nil, entry: entry)
             return nil
         }
