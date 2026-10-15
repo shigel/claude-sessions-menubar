@@ -224,6 +224,7 @@ final class SessionListViewModel: ObservableObject {
                 $0.title.lowercased().contains(needle)
                     || $0.shortId.lowercased().contains(needle)
                     || ($0.profileLabel?.lowercased().contains(needle) ?? false)
+                    || ($0.agent.badge?.lowercased().contains(needle) ?? false)
             }
             guard !matchingSessions.isEmpty else { return nil }
             return FilteredProject(project: project, sessions: matchingSessions, forceExpanded: true)
@@ -928,11 +929,15 @@ private struct ProjectRow: View {
             // their own badges.
             if !row.isExpandable, row.project.profileLabels.count == 1,
                let profileLabel = row.project.profileLabels.first {
-                Text(profileLabel)
+                Badge(profileLabel)
                     .font(.caption2)
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 1)
-                    .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                    .foregroundColor(.secondary)
+            }
+            // Same rule for the agent badge (issue #10): a lone Codex
+            // session has no child row, so "codex" surfaces here.
+            if let agentBadge = row.project.loneSessionAgentBadge {
+                Badge(agentBadge)
+                    .font(.caption2)
                     .foregroundColor(.secondary)
             }
             if row.visibleSessionCount > 1 {
@@ -996,16 +1001,22 @@ private struct SessionChildRow: View {
                     // than how it was launched. The default profile stays
                     // unbadged, matching how `entrypoint == "cli"` does.
                     if let profileLabel = session.profileLabel {
-                        badge(profileLabel)
+                        Badge(profileLabel)
                     }
-                    if session.entrypoint == "sdk-cli" {
-                        badge("auto")
+                    // Agent next: which tool wrote the log. The raw
+                    // `entrypoint`/originator string is never compared
+                    // here — the parsers fold it into the booleans below.
+                    if let agentBadge = session.agent.badge {
+                        Badge(agentBadge)
+                    }
+                    if session.isUnattended {
+                        Badge("auto")
                     }
                     if session.isBackground {
-                        badge("bg")
+                        Badge("bg")
                     }
-                    if session.entrypoint == "claude-desktop" {
-                        badge("desktop")
+                    if session.isDesktop {
+                        Badge("desktop")
                     }
                     // Always shown, not just as a fallback label: sessions
                     // with the same ai-generated title exist (fork/resume
@@ -1033,7 +1044,17 @@ private struct SessionChildRow: View {
         }
     }
 
-    private func badge(_ text: String) -> some View {
+}
+
+/// The small capsule badge used by both the project row and the session
+/// child row ("vanilla", "codex", "auto", "bg", "desktop"). One renderer so
+/// a styling tweak can't leave the two rows drifting apart. Font and color
+/// are inherited from the enclosing stack.
+private struct Badge: View {
+    let text: String
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
         Text(text)
             .padding(.horizontal, 4)
             .padding(.vertical, 1)

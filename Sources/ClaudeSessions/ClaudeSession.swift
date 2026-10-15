@@ -46,10 +46,20 @@ struct ClaudeSession: Identifiable, Equatable, Hashable {
     /// usable was found and the row is only distinguishable by its id).
     let titleSource: TitleSource
 
-    /// "cli" / "sdk-cli" (unattended, cron-style runs — these typically
-    /// lack an ai-generated title) / "claude-desktop". `nil` when absent
-    /// from the head window.
+    /// Claude Code: "cli" / "sdk-cli" (unattended, cron-style runs — these
+    /// typically lack an ai-generated title) / "claude-desktop". Codex: the
+    /// `originator` field ("codex-tui" / "codex_exec" / "Codex Desktop" /
+    /// "Claude Code" when driven by the Codex plugin from inside Claude
+    /// Code …). `nil` when absent from the head window.
     let entrypoint: String?
+    /// Launched without a human at the keyboard: Claude Code `sdk-cli`,
+    /// Codex `codex exec`, or Codex driven by the Codex plugin from inside
+    /// Claude Code. Decided at parse time by the agent's own parser, so the
+    /// view never compares agent-specific originator strings.
+    let isUnattended: Bool
+    /// Started from a desktop app rather than a terminal (Claude Desktop,
+    /// Codex Desktop). Same rationale as `isUnattended`.
+    let isDesktop: Bool
     /// `sessionKind == "bg"` in the log.
     let isBackground: Bool
     /// Which Claude Code config directory this session was found under (see
@@ -58,6 +68,11 @@ struct ClaudeSession: Identifiable, Equatable, Hashable {
     /// window a project row opens is the same one no matter which profile
     /// the session was recorded in.
     let profileLabel: String?
+    /// Which coding agent wrote this log. Display-only, like `profileLabel`:
+    /// grouping stays keyed by `cwd`, so a Codex session and a Claude Code
+    /// session in the same directory share one project row and focus the
+    /// same editor window (issue #10).
+    let agent: Agent
 
     // `fileURL.path`, not `sessionId` — see `sessionId`'s doc comment above:
     // it's not unique across profiles, so using it here would contradict
@@ -65,7 +80,32 @@ struct ClaudeSession: Identifiable, Equatable, Hashable {
     // (AI review nit on PR #6).
     var id: String { fileURL.path }
     /// Short form for degraded display, e.g. "f909915e".
-    var shortId: String { String(sessionId.prefix(8)) }
+    var shortId: String { Self.shortId(sessionId) }
+
+    /// The one place the short-id width lives; the `.sessionId` title rung
+    /// in both scanners calls this so the fallback title always equals the
+    /// short id rendered beside it.
+    static func shortId(_ sessionId: String) -> String { String(sessionId.prefix(8)) }
+}
+
+/// The coding agent whose session log a `ClaudeSession` was built from.
+/// Each case has its own on-disk layout and parser inside `SessionScanner`;
+/// everything downstream (grouping, rows, editor focus) is agent-agnostic.
+enum Agent: String, Equatable, Hashable {
+    /// `<profile>/projects/<encoded-dir>/<sessionId>.jsonl`.
+    case claudeCode
+    /// `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<id>.jsonl`.
+    case codex
+
+    /// Badge text shown next to a session (nil = no badge). Claude Code is
+    /// the app's original and still-default subject, so it stays unbadged
+    /// the way the default profile and `entrypoint == "cli"` do.
+    var badge: String? {
+        switch self {
+        case .claudeCode: return nil
+        case .codex: return "codex"
+        }
+    }
 }
 
 /// Which rung of the title fallback chain produced `ClaudeSession.title`.
@@ -82,6 +122,13 @@ enum TitleSource: String, Equatable, Hashable {
     /// "/plaud:plaud-pipeline". Rescues unattended `sdk-cli` sessions that
     /// have no ai-title and no free-text prompt to fall back on.
     case slashCommand
+    /// Codex only: `thread_name` from `~/.codex/session_index.jsonl`, the
+    /// name Codex itself shows for the thread. Ranked with `.aiTitle`.
+    case threadName
+    /// Codex only: the first user message in the head window, truncated.
+    /// Codex logs have no `last-prompt` rung, so this is the free-text
+    /// fallback for threads missing from the index.
+    case firstPrompt
     /// Nothing usable was found anywhere in the read windows; `title`
     /// equals `shortId`.
     case sessionId
