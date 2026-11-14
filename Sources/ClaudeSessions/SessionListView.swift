@@ -69,6 +69,16 @@ final class SessionListViewModel: ObservableObject {
     /// greets the user on reopen.
     @Published var expandedProjects: Set<String> = []
 
+    /// Bumped every time `refresh(collapseExpanded: true)` (a real popover
+    /// open) picks up a fresh scan. The window is never torn down between
+    /// opens (`orderOut(_:)`, not close — see `projectsWatcher`'s doc
+    /// comment), so the `List`'s scroll position survives across opens on
+    /// its own; without an explicit nudge, a session that landed at the top
+    /// of a newly-reordered list could be scrolled out of view above the
+    /// visible range (issue #29, root cause 1). The view observes this to
+    /// scroll back to the top row.
+    @Published var scrollToTopToken: Int = 0
+
     /// Prefetched editor window list, started as soon as the popover opens
     /// (in parallel with the session scan in `refresh()`) so that
     /// `selectSession(_:)` doesn't have to pay for the `osascript`
@@ -91,13 +101,17 @@ final class SessionListViewModel: ObservableObject {
     /// PR #7).
     private var projectsWatcher: ProjectsWatcher?
 
-    /// Debounces `ProjectsWatcher` callbacks on top of the 0.5s coalescing
-    /// `ProjectsWatcher` already does at the OS level. An active session
-    /// appends to its jsonl file on every turn, so without this a long
-    /// session left open in the popover would re-trigger `refresh()` — and
-    /// therefore a full `SessionScanner.scan()` — every few seconds. This
-    /// adds a longer, trailing-edge wait so bursts collapse into one
-    /// refresh instead of one per burst tick.
+    /// Throttles `ProjectsWatcher` callbacks on top of the 0.5s coalescing
+    /// `ProjectsWatcher` already does at the OS level. Deliberately a
+    /// leading-edge THROTTLE, not a trailing-edge debounce: an earlier
+    /// version cancelled and restarted a 2-second wait on every callback,
+    /// which meant a continuously-writing session (new FSEvents callbacks
+    /// every ~0.5s for as long as it kept appending) could starve the wait
+    /// indefinitely and never actually refresh while the popover stayed
+    /// open (issue #29, root cause 3). `scheduleDebouncedRefresh()` is a
+    /// no-op while a refresh is already pending, so the first callback in a
+    /// burst schedules one guaranteed refresh ~2 seconds later regardless of
+    /// how many more callbacks arrive before then.
     private var refreshDebounceTask: Task<Void, Never>?
 
     /// Bumped by every `refresh()` call. `refresh()` only commits its
@@ -120,14 +134,22 @@ final class SessionListViewModel: ObservableObject {
             // `FSEventStreamSetDispatchQueue` in `ProjectsWatcher`), so hop
             // onto the main actor before touching view model state.
             Task { @MainActor in
-                guard let self else { return }
-                self.refreshDebounceTask?.cancel()
-                self.refreshDebounceTask = Task { [weak self] in
-                    try? await Task.sleep(for: .seconds(2))
-                    guard !Task.isCancelled, let self else { return }
-                    await self.refresh(collapseExpanded: false)
-                }
+                self?.scheduleDebouncedRefresh()
             }
+        }
+    }
+
+    /// Schedules a throttled `refresh()` ~2 seconds after the first
+    /// `ProjectsWatcher` callback in a burst — see `refreshDebounceTask`'s
+    /// doc comment for why this must not reset its wait on every callback.
+    private func scheduleDebouncedRefresh() {
+        guard refreshDebounceTask == nil else { return }
+        refreshDebounceTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard let self else { return }
+            self.refreshDebounceTask = nil
+            guard !Task.isCancelled else { return }
+            await self.refresh(collapseExpanded: false)
         }
     }
 
@@ -294,6 +316,15 @@ final class SessionListViewModel: ObservableObject {
             // that call completes.
             generation += 1
             statusMessage = nil
+            // Reset to the top row rather than leaving whatever was
+            // selected last time: `syncSelectionIfNeeded()` below only
+            // replaces `selectedID` when it's no longer present in
+            // `visibleRows`, so without this, reopening the panel on a
+            // session that's still in the list would keep the previous
+            // selection (and therefore the previous scroll position)
+            // instead of jumping back to the newest session at the top
+            // (issue #29, root cause 1).
+            selectedID = nil
         }
         refreshGeneration += 1
         let thisRefreshGeneration = refreshGeneration
@@ -329,6 +360,9 @@ final class SessionListViewModel: ObservableObject {
         isLoading = false
         hasAccessibilityPermission = WindowController.checkAccessibilityPermission(prompt: false)
         syncSelectionIfNeeded()
+        if collapseExpanded {
+            scrollToTopToken += 1
+        }
     }
 
     /// Keeps `selectedID` pointing at a row that's still present in
@@ -742,55 +776,66 @@ struct SessionListView: View {
     }
 
     private var sessionList: some View {
-        List(selection: $viewModel.selectedID) {
-            ForEach(viewModel.visibleRows) { row in
-                rowView(for: row)
-                    .tag(row.id)
+        ScrollViewReader { proxy in
+            List(selection: $viewModel.selectedID) {
+                ForEach(viewModel.visibleRows) { row in
+                    rowView(for: row)
+                        .tag(row.id)
+                }
             }
-        }
-        .listStyle(.plain)
-        .focused($focusTarget, equals: .list)
-        .onKeyPress(.return) {
-            viewModel.openSelectedRow() ? .handled : .ignored
-        }
-        // Left/right arrow handling is safe as `.onKeyPress` on `List` for
-        // the same reason `.onKeyPress(.return)` above already was: the
-        // IME-breaking failure mode documented on `downArrowMonitor` was
-        // specific to attaching `onKeyPress` to a `TextField`, which holds
-        // IME composition state. `List` has no text composition state to
-        // corrupt, so no `NSEvent`-monitor workaround is needed here.
-        .onKeyPress(.rightArrow) {
-            guard let id = viewModel.selectedID, let row = viewModel.row(for: id) else { return .ignored }
-            switch row.kind {
-            case .session:
-                return .ignored
-            case .project:
-                guard row.isExpandable else { return .ignored }
-                if !row.isExpanded {
-                    viewModel.expand(row.project.path)
+            .listStyle(.plain)
+            .focused($focusTarget, equals: .list)
+            .onKeyPress(.return) {
+                viewModel.openSelectedRow() ? .handled : .ignored
+            }
+            // Left/right arrow handling is safe as `.onKeyPress` on `List` for
+            // the same reason `.onKeyPress(.return)` above already was: the
+            // IME-breaking failure mode documented on `downArrowMonitor` was
+            // specific to attaching `onKeyPress` to a `TextField`, which holds
+            // IME composition state. `List` has no text composition state to
+            // corrupt, so no `NSEvent`-monitor workaround is needed here.
+            .onKeyPress(.rightArrow) {
+                guard let id = viewModel.selectedID, let row = viewModel.row(for: id) else { return .ignored }
+                switch row.kind {
+                case .session:
+                    return .ignored
+                case .project:
+                    guard row.isExpandable else { return .ignored }
+                    if !row.isExpanded {
+                        viewModel.expand(row.project.path)
+                        return .handled
+                    }
+                    // Already expanded: move selection down onto its first
+                    // child, which — by construction of `visibleRows` — is the
+                    // very next row after this project row.
+                    let rows = viewModel.visibleRows
+                    if let index = rows.firstIndex(where: { $0.id == id }), index + 1 < rows.count,
+                       case .session = rows[index + 1].kind {
+                        viewModel.selectedID = rows[index + 1].id
+                    }
                     return .handled
                 }
-                // Already expanded: move selection down onto its first
-                // child, which — by construction of `visibleRows` — is the
-                // very next row after this project row.
-                let rows = viewModel.visibleRows
-                if let index = rows.firstIndex(where: { $0.id == id }), index + 1 < rows.count,
-                   case .session = rows[index + 1].kind {
-                    viewModel.selectedID = rows[index + 1].id
-                }
-                return .handled
             }
-        }
-        .onKeyPress(.leftArrow) {
-            guard let id = viewModel.selectedID, let row = viewModel.row(for: id) else { return .ignored }
-            switch row.kind {
-            case .session:
-                viewModel.collapse(row.project.path)
-                return .handled
-            case .project:
-                guard row.isExpanded else { return .ignored }
-                viewModel.collapse(row.project.path)
-                return .handled
+            .onKeyPress(.leftArrow) {
+                guard let id = viewModel.selectedID, let row = viewModel.row(for: id) else { return .ignored }
+                switch row.kind {
+                case .session:
+                    viewModel.collapse(row.project.path)
+                    return .handled
+                case .project:
+                    guard row.isExpanded else { return .ignored }
+                    viewModel.collapse(row.project.path)
+                    return .handled
+                }
+            }
+            .onChange(of: viewModel.scrollToTopToken) { _, _ in
+                // Fires once per real popover open (see
+                // `scrollToTopToken`'s doc comment) — scrolls back to the
+                // newest session at the top instead of leaving a stale
+                // scroll position from whenever the panel was last closed.
+                if let topID = viewModel.visibleRows.first?.id {
+                    proxy.scrollTo(topID, anchor: .top)
+                }
             }
         }
     }

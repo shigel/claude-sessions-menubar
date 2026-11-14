@@ -66,6 +66,13 @@ enum SessionScanner {
     ///   the head would cost far more (median offset 56KB, max 2.6MB) for
     ///   no benefit, since first and last ai-title values were verified to
     ///   agree in every sampled file.
+    /// - `headEscalatedBytes`: a single, bounded retry for the rare file
+    ///   (observed up to 140,913 bytes) whose first line is a long
+    ///   `queue-operation` carrying the full prompt text, pushing `cwd` (on
+    ///   the next line) past `headBytes` — the session is then silently
+    ///   dropped from the list instead of just missing its title (issue #29,
+    ///   root cause 2). Mirrors `tailEscalatedBytes` below: a ONE-TIME
+    ///   escalation, never a fallback to reading the whole file.
     /// - `tailEscalatedBytes`: a single, bounded retry for the rare file
     ///   (~70/363) whose 64KB tail contains no complete line at all — e.g.
     ///   a single tool_result line larger than the window. This must stay
@@ -74,6 +81,7 @@ enum SessionScanner {
     ///   ~656MB per scan.
     private enum Window {
         static let headBytes = 8 * 1024
+        static let headEscalatedBytes = 256 * 1024
         static let tailBytes = 64 * 1024
         static let tailEscalatedBytes = 256 * 1024
     }
@@ -217,8 +225,22 @@ enum SessionScanner {
             return cached
         }
 
-        let headLines = readHeadWindow(entry.url, bytes: Window.headBytes)
-        guard let cwd = extractCwd(from: headLines) else { return nil }
+        var headLines = readHeadWindow(entry.url, bytes: Window.headBytes)
+        var cwd = extractCwd(from: headLines)
+
+        // One bounded retry with a larger head window when `cwd` wasn't
+        // found within `headBytes` — e.g. a session that opened with a very
+        // long prompt, pushing the first `cwd`-bearing line further into the
+        // file than usual (issue #29, root cause 2). Without this, such a
+        // session is silently dropped from the list entirely rather than
+        // merely losing some metadata. `headLines` is reassigned to the
+        // escalated read (a strict superset of the original window) so the
+        // metadata/title extraction below benefits from it too.
+        if cwd == nil, entry.size > Window.headBytes {
+            headLines = readHeadWindow(entry.url, bytes: Window.headEscalatedBytes)
+            cwd = extractCwd(from: headLines)
+        }
+        guard let cwd else { return nil }
 
         // The jsonl basename equals the sessionId field for every session
         // observed on disk, so deriving it from the filename avoids
